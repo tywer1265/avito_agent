@@ -7,7 +7,7 @@
 # ── Core async framework ──────────────────────
 fastapi==0.115.5
 uvicorn[standard]==0.32.1
-httpx==0.28.0                  # async HTTP client (Avito API, Nano Banana, NewsAPI)
+httpx==0.27.2                  # async HTTP client (Avito API, Nano Banana, NewsAPI)
 aiohttp==3.11.10               # backup async client + VK API
 
 # ── Database ──────────────────────────────────
@@ -20,7 +20,7 @@ apscheduler==3.10.4
 pytz==2024.2                   # timezone support (MSK = Europe/Moscow)
 
 # ── Anthropic AI ──────────────────────────────
-anthropic==0.39.0              # Claude Sonnet 4.5 + Haiku
+anthropic==0.49.0              # Claude Sonnet 4.5 + Haiku
 
 # ── Telegram Bot ──────────────────────────────
 python-telegram-bot==21.9      # async Telegram Bot API
