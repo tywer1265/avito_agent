@@ -7,7 +7,7 @@ from telegram.ext import Application, MessageHandler, CommandHandler, filters, C
 import anthropic
 
 # ── Config ──────────────────────────────────────────────
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+TELEGRAM_TOKEN = os.getenv("CLIENT_BOT_TOKEN")
 ANTHROPIC_KEY = os.getenv("ANTHROPIC_API_KEY")
 OWNER_CHAT_ID = int(os.getenv("TELEGRAM_OWNER_CHAT_ID", "5016220108"))
 
