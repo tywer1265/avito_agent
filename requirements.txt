@@ -1,0 +1,45 @@
+# ─────────────────────────────────────────────
+# Avito Agents — Production Dependencies
+# Python 3.11+ compatible (use 3.11 on DigitalOcean;
+# CPython 3.14 is pre-release and not yet stable for prod)
+# ─────────────────────────────────────────────
+
+# ── Core async framework ──────────────────────
+fastapi==0.115.5
+uvicorn[standard]==0.32.1
+httpx==0.28.0                  # async HTTP client (Avito API, Nano Banana, NewsAPI)
+aiohttp==3.11.10               # backup async client + VK API
+
+# ── Database ──────────────────────────────────
+asyncpg==0.30.0                # async PostgreSQL driver
+sqlalchemy[asyncio]==2.0.36    # ORM + async engine
+alembic==1.14.0                # schema migrations
+
+# ── Task scheduling ───────────────────────────
+apscheduler==3.10.4
+pytz==2024.2                   # timezone support (MSK = Europe/Moscow)
+
+# ── Anthropic AI ──────────────────────────────
+anthropic==0.39.0              # Claude Sonnet 4.5 + Haiku
+
+# ── Telegram Bot ──────────────────────────────
+python-telegram-bot==21.9      # async Telegram Bot API
+
+# ── Data validation & serialisation ───────────
+pydantic==2.10.3               # strict JSON schema validation between agents
+pydantic-settings==2.6.1       # .env loading via BaseSettings
+
+# ── Utilities ─────────────────────────────────
+python-dotenv==1.0.1           # .env file loader
+tenacity==9.0.0                # retry logic with exponential backoff
+structlog==24.4.0              # structured JSON logging
+orjson==3.10.12                # fast JSON serialisation
+python-dateutil==2.9.0.post0   # date parsing helpers
+
+# ── Monitoring / cost tracking ────────────────
+prometheus-client==0.21.1      # optional: expose /metrics endpoint
+
+# ── Dev / testing (not installed in prod) ─────
+# pytest==8.3.4
+# pytest-asyncio==0.24.0
+# respx==0.21.1                # mock httpx in tests
