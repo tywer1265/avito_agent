@@ -59,6 +59,7 @@ async def lifespan(app: FastAPI):
     log.info("avito_agents.scheduler_started", jobs=len(scheduler.get_jobs()))
 
     # 3. Notify owner
+    await asyncio.sleep(2)  # wait for bot thread
     await send_alert(
         f"🚀 *Avito Agents запущены*\n"
         f"Среда: `{settings.app_env}`\n"
