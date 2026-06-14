@@ -225,3 +225,14 @@ if __name__ == "__main__":
         reload=settings.api_reload,
         log_level=settings.log_level.lower(),
     )
+
+
+# ── Telegram client bot (runs alongside FastAPI) ──────────
+import threading
+import subprocess
+import sys
+
+def run_tg_bot():
+    subprocess.run([sys.executable, "tg_agent.py"])
+
+threading.Thread(target=run_tg_bot, daemon=True).start()
