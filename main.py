@@ -72,7 +72,6 @@ async def lifespan(app: FastAPI):
     log.info("avito_agents.shutdown")
     scheduler.shutdown(wait=False)
     await close_db()
-    await send_alert("🔴 *Avito Agents остановлены*")
 
 
 # ── FastAPI app ────────────────────────────────────────────────
