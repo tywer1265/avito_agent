@@ -1,7 +1,7 @@
 import asyncio
 import os
 import json
-from datetime import datetime
+import httpx
 from telegram import Update
 from telegram.ext import Application, MessageHandler, CommandHandler, filters, ContextTypes
 import anthropic
@@ -10,25 +10,32 @@ import anthropic
 TELEGRAM_TOKEN = os.getenv("CLIENT_BOT_TOKEN")
 ANTHROPIC_KEY = os.getenv("ANTHROPIC_API_KEY")
 OWNER_CHAT_ID = int(os.getenv("TELEGRAM_OWNER_CHAT_ID", "5016220108"))
+N8N_INVENTORY_URL = "https://tywer1265.app.n8n.cloud/webhook/inventory"
 
 client = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
+conversations = {}
 
-# ── Память диалогов ─────────────────────────────────────
-conversations = {}  # chat_id -> list of messages
-products_db = {
-    "худи": {"name": "Худи оверсайз", "price": 2900, "sizes": ["S", "M", "L", "XL"], "color": "чёрный/белый/серый"},
-    "футболка": {"name": "Футболка базовая", "price": 1500, "sizes": ["S", "M", "L", "XL"], "color": "белый/чёрный"},
-    "штаны": {"name": "Штаны карго", "price": 3200, "sizes": ["S", "M", "L", "XL"], "color": "чёрный/хаки"},
-    "кепка": {"name": "Кепка", "price": 1200, "sizes": ["ONE SIZE"], "color": "чёрный/белый"},
-}
+async def get_inventory() -> str:
+    try:
+        async with httpx.AsyncClient(timeout=5) as http:
+            resp = await http.get(N8N_INVENTORY_URL)
+            data = resp.json()
+            items = data.get("inventory", [])
+            if not items:
+                return "Склад временно недоступен"
+            lines = []
+            for item in items:
+                lines.append(f"- {item['name']} ({item['size']}): {item['price']}₽, остаток: {item['stock']} шт")
+            return "\n".join(lines)
+    except Exception:
+        return "Склад временно недоступен"
 
-SYSTEM_PROMPT = """Ты — менеджер по продажам одежды на Авито. Твоя задача — отвечать покупателям вежливо, коротко и по делу.
+async def build_system_prompt() -> str:
+    inventory = await get_inventory()
+    return f"""Ты — менеджер по продажам одежды LOCAL Store. Отвечай покупателям вежливо, коротко и по делу.
 
-ТОВАРЫ В НАЛИЧИИ:
-- Худи оверсайз: 2900₽, размеры S/M/L/XL, цвета: чёрный/белый/серый
-- Футболка базовая: 1500₽, размеры S/M/L/XL, цвета: белый/чёрный  
-- Штаны карго: 3200₽, размеры S/M/L/XL, цвета: чёрный/хаки
-- Кепка: 1200₽, ONE SIZE, цвета: чёрный/белый
+ТОВАРЫ В НАЛИЧИИ (актуально):
+{inventory}
 
 ПРАВИЛА:
 1. Отвечай коротко — 1-3 предложения максимум
@@ -39,6 +46,7 @@ SYSTEM_PROMPT = """Ты — менеджер по продажам одежды 
 6. Пиши как живой человек, без официоза
 7. Если покупатель грубит — вежливо но твёрдо отвечай
 8. При эскалации (возврат, конфликт) — напиши "ЭСКАЛАЦИЯ:" в начале ответа
+9. Если товара нет в списке — честно скажи что нет в наличии
 
 СТИЛЬ: дружелюбный, живой, не роботизированный"""
 
@@ -47,11 +55,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     conversations[chat_id] = []
     await update.message.reply_text(
         "👋 Привет! Я менеджер магазина LOCAL Store.\n\n"
-        "У нас есть:\n"
-        "• Худи оверсайз — 2900₽\n"
-        "• Футболки — 1500₽\n"
-        "• Штаны карго — 3200₽\n"
-        "• Кепки — 1200₽\n\n"
         "Чем могу помочь? 😊"
     )
 
@@ -75,54 +78,47 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     user_text = update.message.text
     user_name = update.effective_user.first_name or "Покупатель"
-    
-    # Инициализация диалога
+
     if chat_id not in conversations:
         conversations[chat_id] = []
-    
-    # Добавляем сообщение пользователя
+
     conversations[chat_id].append({
         "role": "user",
         "content": f"{user_name}: {user_text}"
     })
-    
-    # Ограничиваем историю — последние 20 сообщений
+
     if len(conversations[chat_id]) > 20:
         conversations[chat_id] = conversations[chat_id][-20:]
-    
-    # Показываем что печатаем
+
     await context.bot.send_chat_action(chat_id=chat_id, action="typing")
-    
+
     try:
-        # Вызов Claude Haiku (быстрый и дешёвый)
+        system_prompt = await build_system_prompt()
+
         response = client.messages.create(
             model="claude-haiku-4-5-20251001",
             max_tokens=300,
-            system=SYSTEM_PROMPT,
+            system=system_prompt,
             messages=conversations[chat_id]
         )
-        
+
         reply = response.content[0].text
-        
-        # Добавляем ответ в историю
+
         conversations[chat_id].append({
-            "role": "assistant", 
+            "role": "assistant",
             "content": reply
         })
-        
-        # Проверяем эскалацию
+
         if reply.startswith("ЭСКАЛАЦИЯ:"):
             clean_reply = reply.replace("ЭСКАЛАЦИЯ:", "").strip()
             await update.message.reply_text(clean_reply)
-            # Уведомляем владельца
-            if OWNER_CHAT_ID:
-                await context.bot.send_message(
-                    chat_id=OWNER_CHAT_ID,
-                    text=f"🚨 ЭСКАЛАЦИЯ от {user_name}!\n\nСообщение: {user_text}\n\nОтвет агента: {clean_reply}"
-                )
+            await context.bot.send_message(
+                chat_id=OWNER_CHAT_ID,
+                text=f"🚨 ЭСКАЛАЦИЯ от {user_name}!\n\nСообщение: {user_text}\n\nОтвет: {clean_reply}"
+            )
         else:
             await update.message.reply_text(reply)
-            
+
     except Exception as e:
         await update.message.reply_text("Секунду, уточню информацию и отвечу! 🙏")
         print(f"Error: {e}")
@@ -130,12 +126,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def main():
     print("🤖 Запуск Telegram агента...")
     app = Application.builder().token(TELEGRAM_TOKEN).build()
-    
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("reset", reset))
     app.add_handler(CommandHandler("stats", stats))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    
     print("✅ Агент запущен! Пиши боту в Telegram.")
     app.run_polling(drop_pending_updates=True)
 
