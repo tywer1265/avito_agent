@@ -9,47 +9,36 @@ meta_agent.py — Meta Agent (оркестратор цепочек агенто
   - Валидация на каждом шаге (роль "критика"): мусор не едет дальше
   - Ретраи с экспоненциальным backoff на transient-сбои
   - Стоп-цепочка при фатальной ошибке + алерт владельцу
-  - Полная наблюдаемость: каждый шаг логируется
+  - Полная наблюдаемость: каждый шаг логируется в PostgreSQL
   - Килсвитч: можно остановить публикацию одной переменной окружения
 
-====================================================================
-ДОПУЩЕНИЯ (проверь и поправь под свой код — отмечено # ASSUMPTION)
-====================================================================
-1. MetaAgent наследует BaseAgent из core.base_agent.
-2. У BaseAgent есть async/sync методы:
-       self.log(level: str, message: str, **extra)        -> запись в PostgreSQL
-       self.report_to_telegram(text: str)                 -> алерт владельцу
-   Если они синхронные — убери await перед ними (см. _alog / _areport).
-3. Шаги pipeline — это async-функции вида:
-       async def step(ctx: dict) -> dict
-   которые принимают накопленный контекст и возвращают свой результат (dict).
-   Свои агенты ты оборачиваешь в такие функции (примеры внизу файла).
-4. Килсвитч: переменная окружения META_AGENT_PUBLISH_ENABLED.
-   Если != "1" — шаг с флагом is_publish=True не выполнится (цепочка
-   дойдёт до него, подготовит всё, но НЕ выложит и предупредит тебя).
-====================================================================
+Совместимость с твоим core/base_agent.py проверена:
+  - наследует BaseAgent (ABC), реализует обязательный execute()
+  - __init__(self) без аргументов, как у BaseAgent
+  - использует реальные сигнатуры self.log(action, result, status=...)
+    и self.report_to_telegram(message)
+  - шаги, работающие с твоими агентами, вызывают agent.run(task) и
+    превращают {"status": "error"} в исключение (см. пример внизу)
 """
 
 from __future__ import annotations
 
 import os
 import asyncio
-import inspect
 import time
 import traceback
 from dataclasses import dataclass, field
 from typing import Awaitable, Callable, Optional
 
-from core.base_agent import BaseAgent  # ASSUMPTION: путь к BaseAgent
+from core.base_agent import BaseAgent
 
 
 # --- типы ----------------------------------------------------------
 
-# Шаг pipeline: принимает контекст, возвращает свой кусок результата.
+# Шаг pipeline: принимает накопленный контекст, возвращает свой кусок (dict).
 StepFn = Callable[[dict], Awaitable[dict]]
 
-# Валидатор: смотрит на результат шага, возвращает (ok, причина).
-# Это роль "критика" из agent-thinking — мусор не должен ехать дальше.
+# Валидатор (роль "критика"): смотрит на результат шага -> (ok, причина).
 ValidatorFn = Callable[[dict], "tuple[bool, str]"]
 
 
@@ -92,9 +81,9 @@ class PipelineResult:
     failed_step: Optional[str] = None
 
     def summary(self) -> str:
-        lines = [f"Pipeline «{self.pipeline}»: {'✅ OK' if self.ok else '❌ FAILED'}"]
+        lines = [f"Pipeline «{self.pipeline}»: {'OK' if self.ok else 'FAILED'}"]
         for o in self.outcomes:
-            mark = "✅" if o.ok else "❌"
+            mark = "[ok]" if o.ok else "[x]"
             extra = f" ({o.attempts} попыт., {o.duration_sec:.1f}с)"
             line = f"  {mark} {o.name}{extra}"
             if o.error:
@@ -110,12 +99,35 @@ class PipelineResult:
 class MetaAgent(BaseAgent):
     """
     Оркестратор. Регистрируешь pipeline'ы через register_pipeline(),
-    запускаешь через run_pipeline(name, initial_context).
+    запускаешь через run_pipeline(name, initial_context) либо через
+    стандартный BaseAgent.run({"pipeline": "...", "context": {...}}).
     """
 
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
+    name: str = "meta_agent"
+
+    def __init__(self) -> None:
+        super().__init__()
         self._pipelines: dict[str, Pipeline] = {}
+
+    # -- обязательный метод BaseAgent (ABC) ---------------------
+
+    async def execute(self, task: dict) -> dict:
+        """
+        Точка входа от scheduler через BaseAgent.run().
+        task = {"pipeline": "<name>", "context": {...}}.
+        Возвращает dict (контракт BaseAgent).
+        """
+        pipeline_name = task.get("pipeline")
+        if not pipeline_name:
+            raise ValueError("execute(): в task нет ключа 'pipeline'")
+        result = await self.run_pipeline(pipeline_name, task.get("context"))
+        return {
+            "status": "ok" if result.ok else "error",
+            "pipeline": result.pipeline,
+            "failed_step": result.failed_step,
+            "summary": result.summary(),
+            "context": result.context,
+        }
 
     # -- регистрация --------------------------------------------
 
@@ -136,13 +148,13 @@ class MetaAgent(BaseAgent):
         context: dict = dict(initial_context or {})
         result = PipelineResult(pipeline=name, ok=True, context=context)
 
-        await self._alog("info", f"▶️ Старт pipeline «{name}»")
+        await self._alog("info", f"Старт pipeline «{name}»")
 
         for step in pipeline.steps:
             # Килсвитч для публикующих шагов.
             if step.is_publish and not _publish_enabled():
                 msg = (
-                    f"⏸️ Шаг «{step.name}» пропущен: килсвитч "
+                    f"Шаг «{step.name}» пропущен: килсвитч "
                     f"META_AGENT_PUBLISH_ENABLED != 1. Карточка подготовлена, "
                     f"но НЕ опубликована."
                 )
@@ -171,7 +183,7 @@ class MetaAgent(BaseAgent):
                 await self._areport(alert)
                 return result
 
-        await self._alog("info", f"✅ Pipeline «{name}» завершён успешно")
+        await self._alog("info", f"Pipeline «{name}» завершён успешно")
         await self._areport(f"✅ {name} — готово.\n\n{result.summary()}")
         return result
 
@@ -183,10 +195,7 @@ class MetaAgent(BaseAgent):
 
         for attempt in range(1, step.max_retries + 2):  # 1 + retries
             try:
-                await self._alog(
-                    "info",
-                    f"  → шаг «{step.name}» попытка {attempt}",
-                )
+                await self._alog("info", f"шаг «{step.name}» попытка {attempt}")
                 # Таймаут на шаг — защита от зависших вызовов модели/API.
                 output = await asyncio.wait_for(
                     step.fn(context), timeout=step.timeout_sec
@@ -197,7 +206,7 @@ class MetaAgent(BaseAgent):
                         f"шаг вернул {type(output).__name__}, ожидался dict"
                     )
 
-                # Роль критика: валидируем результат до того, как пустить дальше.
+                # Роль критика: валидируем до того, как пустить результат дальше.
                 if step.validator is not None:
                     ok, reason = step.validator(output)
                     if not ok:
@@ -215,14 +224,13 @@ class MetaAgent(BaseAgent):
             except asyncio.TimeoutError:
                 last_error = f"таймаут {step.timeout_sec}с"
             except (ValueError, TypeError) as e:
-                # Логические ошибки/валидация — обычно ретрай не спасёт,
-                # но один повтор дадим (модель могла дать кривой ответ).
+                # Логика/валидация: один повтор дадим (модель могла дать кривой ответ).
                 last_error = str(e)
             except Exception as e:  # transient: сеть, 5xx, rate limit
                 last_error = f"{type(e).__name__}: {e}"
                 await self._alog(
                     "warning",
-                    f"  шаг «{step.name}» упал: {last_error}\n"
+                    f"шаг «{step.name}» упал: {last_error}\n"
                     f"{traceback.format_exc(limit=3)}",
                 )
 
@@ -237,15 +245,15 @@ class MetaAgent(BaseAgent):
             duration_sec=duration, error=last_error,
         )
 
-    # -- адаптеры под sync/async BaseAgent ----------------------
-    # Если твои log/report_to_telegram синхронные — эти обёртки всё равно
-    # сработают. Если async — тоже. Менять ничего не нужно.
+    # -- обёртки над BaseAgent (реальные сигнатуры) -------------
 
     async def _alog(self, level: str, message: str) -> None:
-        await _maybe_await(self.log, level, message)
+        # BaseAgent.log(action, result, ..., status=...). Маппим level в status.
+        status = "error" if level == "error" else "ok"
+        await self.log(action="meta_agent", result=message, status=status)
 
     async def _areport(self, text: str) -> None:
-        await _maybe_await(self.report_to_telegram, text)
+        await self.report_to_telegram(text)
 
 
 # --- утилиты -------------------------------------------------------
@@ -254,17 +262,12 @@ def _publish_enabled() -> bool:
     return os.getenv("META_AGENT_PUBLISH_ENABLED", "0") == "1"
 
 
-async def _maybe_await(fn: Callable, *args, **kwargs):
-    """Вызывает fn; если результат awaitable — ждёт его. Sync/async агностик."""
-    res = fn(*args, **kwargs)
-    if inspect.isawaitable(res):
-        return await res
-    return res
-
-
 # ===================================================================
 # ПРИМЕР СБОРКИ ЦЕПОЧКИ ВЫКЛАДКИ
-# Это шаблон. Подставь вызовы своих реальных агентов внутрь функций-шагов.
+# Подставь свои реальные агенты. Главное (под твой BaseAgent):
+# agent.run(task) НЕ бросает исключений — при ошибке возвращает
+# {"status": "error", ...}. Поэтому в обёртке проверяем статус и
+# поднимаем исключение сами, чтобы Meta Agent отработал ретрай/стоп.
 # ===================================================================
 #
 # from agents.trend_hunter import TrendHunter
@@ -274,26 +277,35 @@ async def _maybe_await(fn: Callable, *args, **kwargs):
 #
 # trend, designer, copy, publisher = TrendHunter(), Designer(), Copywriter(), Publisher()
 #
+# def _unwrap(res: dict, agent: str) -> dict:
+#     """Превращает {"status":"error"} от agent.run() в исключение."""
+#     if res.get("status") == "error":
+#         raise RuntimeError(f"{agent}: {res.get('error', 'unknown error')}")
+#     return res
+#
 # async def step_trend(ctx: dict) -> dict:
-#     # ASSUMPTION: у агента есть метод, возвращающий выбранную позицию.
-#     item = await trend.pick_item_from_stock()   # ← твой реальный метод
-#     return {"item": item}
+#     res = _unwrap(await trend.run({}), "trend_hunter")
+#     return {"item": res["item"]}            # ← подставь реальные ключи ответа
 #
 # async def step_design(ctx: dict) -> dict:
-#     image_url = await designer.make_card(ctx["item"])
-#     return {"image_url": image_url}
+#     res = _unwrap(await designer.run({"item": ctx["item"]}), "designer")
+#     return {"image_url": res["image_url"]}
 #
 # async def step_copy(ctx: dict) -> dict:
-#     listing = await copy.write_listing(ctx["item"])  # title/description/price
-#     return {"listing": listing}
+#     res = _unwrap(await copy.run({"item": ctx["item"]}), "copywriter")
+#     return {"listing": res["listing"]}      # title / description / price
 #
 # async def step_publish(ctx: dict) -> dict:
-#     avito_id = await publisher.publish(ctx["item"], ctx["image_url"], ctx["listing"])
-#     return {"avito_listing_id": avito_id}
+#     res = _unwrap(await publisher.run({
+#         "item": ctx["item"],
+#         "image_url": ctx["image_url"],
+#         "listing": ctx["listing"],
+#     }), "publisher")
+#     return {"avito_listing_id": res["avito_listing_id"]}
 #
 # # Валидаторы (роль критика) — отсекают мусор до публикации:
 # def v_item(o):    return (bool(o.get("item")), "пустая позиция")
-# def v_image(o):   return (str(o.get("image_url","")).startswith("http"), "нет URL картинки")
+# def v_image(o):   return (str(o.get("image_url", "")).startswith("http"), "нет URL картинки")
 # def v_listing(o):
 #     l = o.get("listing") or {}
 #     if not l.get("title"):       return (False, "пустой заголовок")
@@ -313,6 +325,7 @@ async def _maybe_await(fn: Callable, *args, **kwargs):
 # )
 #
 # # В scheduler.py:
-# # meta = MetaAgent(...)              # как ты инициализируешь остальные агенты
+# # meta = MetaAgent()
 # # meta.register_pipeline(listing_pipeline)
 # # await meta.run_pipeline("avito_listing")
+# # (или через scheduler: await meta.run({"pipeline": "avito_listing"}))
