@@ -40,7 +40,7 @@ def _extract_price(text: str) -> int:
 def _update_order_context(chat_id: int, text: str, inventory: list) -> None:
     """Обновляем контекст заказа если в тексте упомянут товар из склада."""
     if chat_id not in order_context:
-        order_context[chat_id] = {"name": "", "size": "", "price": 0}
+        order_context[chat_id] = {"name": "", "size": "", "price": 0, "article": ""}
 
     text_lower = text.lower()
 
@@ -52,6 +52,7 @@ def _update_order_context(chat_id: int, text: str, inventory: list) -> None:
         ):
             order_context[chat_id]["name"] = item_name
             order_context[chat_id]["price"] = item.get("price", 0)
+            order_context[chat_id]["article"] = item.get("article", "")
             break
 
     # Ищем размер (S, M, L, XL, XXL, XS, 3XL)
@@ -127,14 +128,14 @@ async def build_system_prompt(inventory_text: str) -> str:
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     conversations[chat_id] = []
-    order_context[chat_id] = {"name": "", "size": "", "price": 0}
+    order_context[chat_id] = {"name": "", "size": "", "price": 0, "article": ""}
     await update.message.reply_text("👋 Привет! Я менеджер магазина LOCAL Store.\n\nЧем могу помочь? 😊")
 
 
 async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     conversations[chat_id] = []
-    order_context[chat_id] = {"name": "", "size": "", "price": 0}
+    order_context[chat_id] = {"name": "", "size": "", "price": 0, "article": ""}
     await update.message.reply_text("🔄 Диалог сброшен. Начинаем заново!")
 
 
