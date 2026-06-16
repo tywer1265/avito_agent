@@ -140,7 +140,7 @@ def _update_order_context(chat_id: int, text: str, inventory: list) -> None:
 
     text_lower = text.lower()
     for item in inventory:
-        item_name = item.get("name", "")
+        item_name = str(item.get("name", ""))
         if item_name.lower() in text_lower or any(
             word in text_lower for word in item_name.lower().split() if len(word) > 3
         ):
