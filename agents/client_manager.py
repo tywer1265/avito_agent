@@ -4,11 +4,10 @@ Agent 5 — Client Manager
 Mission: Handle all buyer messages 24/7, close sales.
 Response time target: < 5 minutes
 
-FIXED: 
-- Uses authorization_code flow (refresh_token) instead of client_credentials
-- Chats endpoint: /messenger/v2/ (v3 returns 404 without paid subscription)
-- Send endpoint: /messenger/v1/ for POST (v3 → 405, v2 → 404, v1 → correct endpoint)
-- Sending requires paid "API мессенджера" subscription (402 without it)
+CHANGES:
+- Added intent: purchase_confirmed
+- Added _notify_sale() → POST to n8n webhook → Google Sheets
+- Works for both Telegram (now) and Avito (in 5 days)
 """
 from __future__ import annotations
 
@@ -31,8 +30,9 @@ MAX_DISCOUNT_PCT = 0.10
 FOLLOW_UP_HOURS = 24
 MAX_FOLLOW_UPS = 2
 
-# Path to store tokens between restarts
 TOKEN_CACHE_FILE = os.path.join(os.path.dirname(__file__), "..", "avito_token_cache.json")
+
+N8N_ORDERS_WEBHOOK = "https://tywer1265.app.n8n.cloud/webhook/orders/new"
 
 
 class ClientManagerAgent(BaseAgent):
@@ -49,30 +49,19 @@ class ClientManagerAgent(BaseAgent):
         else:
             return {"status": "ok"}
 
-    # ── Token management (authorization_code flow) ─────────────
+    # ── Token management ───────────────────────────────────────
 
     async def _get_avito_token(self) -> Optional[str]:
-        """
-        Get valid access_token using refresh_token.
-        Falls back to client_credentials only for non-messenger endpoints.
-        """
-        # Try to load cached tokens
         cache = self._load_token_cache()
-        
         refresh_token = cache.get("refresh_token") or os.getenv("AVITO_REFRESH_TOKEN")
         if not refresh_token:
-            self._log.error(
-                "client_manager.no_refresh_token",
-                hint="Run token setup: set AVITO_REFRESH_TOKEN in .env"
-            )
+            self._log.error("client_manager.no_refresh_token")
             return None
 
-        # Check if cached access_token is still valid (expires_at with 5 min buffer)
         expires_at = cache.get("expires_at", 0)
         if cache.get("access_token") and datetime.now().timestamp() < expires_at - 300:
             return cache["access_token"]
 
-        # Refresh the access token
         try:
             async with httpx.AsyncClient(timeout=10) as client:
                 resp = await client.post(
@@ -86,21 +75,15 @@ class ClientManagerAgent(BaseAgent):
                 )
                 resp.raise_for_status()
                 data = resp.json()
-
                 access_token = data.get("access_token")
                 new_refresh = data.get("refresh_token", refresh_token)
                 expires_in = data.get("expires_in", 86400)
-
-                # Save updated tokens to cache
                 self._save_token_cache({
                     "access_token": access_token,
                     "refresh_token": new_refresh,
                     "expires_at": datetime.now().timestamp() + expires_in,
                 })
-
-                self._log.info("client_manager.token_refreshed", expires_in=expires_in)
                 return access_token
-
         except Exception as exc:
             self._log.error("client_manager.token_refresh_error", error=str(exc))
             return None
@@ -124,7 +107,6 @@ class ClientManagerAgent(BaseAgent):
     # ── Message polling ────────────────────────────────────────
 
     async def _poll_and_respond(self) -> dict:
-        """Fetch new messages from Avito and respond to each."""
         token = await self._get_avito_token()
         if not token:
             return {"status": "error", "error": "avito_token_failed"}
@@ -135,6 +117,7 @@ class ClientManagerAgent(BaseAgent):
 
         responded = 0
         escalated = 0
+        sales = 0
         for msg in messages:
             saved_id = await self._save_inbound_message(msg)
             result = await self._handle_message(token, msg, saved_id)
@@ -142,16 +125,19 @@ class ClientManagerAgent(BaseAgent):
                 responded += 1
             elif result == "escalated":
                 escalated += 1
+            elif result == "sale":
+                responded += 1
+                sales += 1
 
-        self._log.info("client_manager.poll_done", responded=responded, escalated=escalated)
-        return {"status": "ok", "responded": responded, "escalated": escalated}
+        self._log.info("client_manager.poll_done",
+                       responded=responded, escalated=escalated, sales=sales)
+        return {"status": "ok", "responded": responded,
+                "escalated": escalated, "sales": sales}
 
     async def _fetch_avito_messages(self, token: str) -> list[dict]:
-        """Get unread messages from Avito Messenger API v2."""
         try:
             async with httpx.AsyncClient(timeout=15) as client:
                 resp = await client.get(
-                    # FIXED: v2 instead of v3
                     f"{settings.avito_api_base_url}/messenger/v2/accounts/{settings.avito_user_id}/chats",
                     headers={"Authorization": f"Bearer {token}"},
                     params={"unread_only": True, "limit": 50},
@@ -161,18 +147,12 @@ class ClientManagerAgent(BaseAgent):
 
                 messages = []
                 for chat in chats:
-                    chat_id = chat.get("id")
                     last_msg = chat.get("last_message", {})
-                    
-                    # Only process incoming messages (direction == "in")
                     if last_msg.get("direction") != "in":
                         continue
-                    
-                    # Skip system messages
                     if last_msg.get("type") == "system":
                         continue
 
-                    # Find buyer (not us)
                     buyer = None
                     for user in chat.get("users", []):
                         if str(user.get("id")) != str(settings.avito_user_id):
@@ -180,7 +160,7 @@ class ClientManagerAgent(BaseAgent):
                             break
 
                     messages.append({
-                        "chat_id": chat_id,
+                        "chat_id": chat.get("id"),
                         "buyer_id": buyer.get("id", "unknown") if buyer else "unknown",
                         "buyer_name": buyer.get("name", "Покупатель") if buyer else "Покупатель",
                         "text": last_msg.get("content", {}).get("text", ""),
@@ -194,7 +174,6 @@ class ClientManagerAgent(BaseAgent):
             return []
 
     async def _handle_message(self, token: str, msg: dict, saved_id: int) -> str:
-        """Classify and respond to one message."""
         text = msg.get("text", "").strip()
         if not text:
             return "skipped"
@@ -219,6 +198,12 @@ class ClientManagerAgent(BaseAgent):
         if success:
             await self._save_outbound_message(msg, reply, saved_id)
             await self._update_message_status(saved_id, "replied")
+
+            # Фиксируем продажу → n8n → Sheets
+            if intent == "purchase_confirmed":
+                await self._notify_sale(msg)
+                return "sale"
+
             return "responded"
         return "skipped"
 
@@ -233,6 +218,7 @@ class ClientManagerAgent(BaseAgent):
 - price_negotiation: торг, просьба о скидке
 - shipping_question: вопрос о доставке
 - product_question: вопрос о характеристиках товара
+- purchase_confirmed: покупатель подтверждает покупку ("беру", "оформляю", "давайте", "договорились", "покупаю", "хочу купить", "оплатил")
 - complaint_simple: простая жалоба
 - dispute: спор, возврат, конфликт
 - review_request: просьба об отзыве
@@ -249,8 +235,8 @@ class ClientManagerAgent(BaseAgent):
             intent = result.strip().lower()
             valid_intents = {
                 "greeting", "availability", "size_question", "price_negotiation",
-                "shipping_question", "product_question", "complaint_simple",
-                "dispute", "review_request", "other",
+                "shipping_question", "product_question", "purchase_confirmed",
+                "complaint_simple", "dispute", "review_request", "other",
             }
             return intent if intent in valid_intents else "other"
         except Exception:
@@ -267,6 +253,7 @@ class ClientManagerAgent(BaseAgent):
             "size_question": "Скажи что уточнишь размер, попроси написать нужный",
             "shipping_question": "Расскажи про доставку (СДЭК, Почта России), сроки 2-7 дней",
             "product_question": "Ответь на вопрос о товаре, подчеркни качество",
+            "purchase_confirmed": "Поблагодари, скажи что оформляешь заказ и свяжешься с деталями доставки",
             "complaint_simple": "Извинись, предложи помощь, будь вежлив",
             "review_request": "Поблагодари, скажи что рад помочь",
             "other": "Ответь вежливо и по существу",
@@ -324,7 +311,7 @@ class ClientManagerAgent(BaseAgent):
 Максимальная скидка: {MAX_DISCOUNT_PCT * 100:.0f}%
 
 Ответь:
-1. Если просят слишком большую скидку — мягко откажи, предложи {floor_price} руб. как окончательную
+1. Если просят слишком большую скидку — мягко откажи, предложи {floor_price} руб.
 2. Если просят разумную скидку — согласись на {floor_price} руб.
 3. Будь дружелюбным, не теряй покупателя
 
@@ -338,10 +325,47 @@ class ClientManagerAgent(BaseAgent):
             )
             return reply.strip()
         except Exception:
-            return f"Добрый день! Могу сделать небольшую скидку. Напишите какую цену рассматриваете?"
+            return "Добрый день! Могу сделать небольшую скидку. Напишите какую цену рассматриваете?"
+
+    # ── Sale notification → n8n → Sheets ──────────────────────
+
+    async def _notify_sale(self, msg: dict) -> None:
+        """Стреляем в n8n webhook — он пишет строку в Google Sheets."""
+        price_str = msg.get("listing_price", "0").replace("₽", "").replace(" ", "").strip()
+        try:
+            price = int(price_str)
+        except ValueError:
+            price = 0
+
+        payload = {
+            "date": datetime.now().strftime("%d.%m"),
+            "name": msg.get("listing_title", ""),
+            "size": "",                        # покупатель должен был написать размер раньше
+            "status": "Ожидает отправки",
+            "price": price,
+            "article": "",                     # добавим в v2 через webhook склада
+        }
+
+        try:
+            async with httpx.AsyncClient(timeout=10) as client:
+                resp = await client.post(N8N_ORDERS_WEBHOOK, json=payload)
+                if resp.status_code == 200:
+                    self._log.info("client_manager.sale_notified", payload=payload)
+                    await self.report_to_telegram(
+                        f"🛍 Новый заказ!\n"
+                        f"Товар: {payload['name']}\n"
+                        f"Цена: {price} ₽\n"
+                        f"Покупатель: {msg.get('buyer_name', '?')}"
+                    )
+                else:
+                    self._log.warning("client_manager.sale_notify_failed",
+                                      status=resp.status_code)
+        except Exception as exc:
+            self._log.error("client_manager.sale_notify_error", error=str(exc))
+
+    # ── Send reply ─────────────────────────────────────────────
 
     async def _send_reply(self, token: str, chat_id: str, text: str) -> bool:
-        """Send reply via Avito Messenger API v1."""
         try:
             async with httpx.AsyncClient(timeout=10) as client:
                 resp = await client.post(
@@ -353,17 +377,8 @@ class ClientManagerAgent(BaseAgent):
                     json={"message": {"text": text}, "type": "text"},
                 )
                 if resp.status_code == 402:
-                    self._log.error(
-                        "client_manager.send_reply_subscription_required",
-                        hint="Требуется подписка 'API мессенджера' на Авито Про: https://www.avito.ru/avitopro/api",
-                    )
+                    self._log.error("client_manager.send_reply_subscription_required")
                     return False
-                if resp.status_code not in (200, 201):
-                    self._log.warning(
-                        "client_manager.send_reply_non_ok",
-                        status=resp.status_code,
-                        body=resp.text[:200],
-                    )
                 return resp.status_code in (200, 201)
         except Exception as exc:
             self._log.error("client_manager.send_reply_error", error=str(exc))
@@ -398,7 +413,6 @@ class ClientManagerAgent(BaseAgent):
                         )
                     sent += 1
 
-        self._log.info("client_manager.followups_sent", sent=sent)
         return {"status": "ok", "followups_sent": sent}
 
     async def _generate_followup(self, msg: Message) -> str:
@@ -407,7 +421,6 @@ class ClientManagerAgent(BaseAgent):
                 system="Ты — менеджер по продажам. Пишешь короткий follow-up.",
                 user=f"""Покупатель интересовался товаром, но не ответил 24 часа.
 Его последнее сообщение: "{msg.content[:100] if msg.content else ''}"
-
 Напиши мягкий follow-up, напомни о товаре, создай лёгкую срочность.
 Максимум 100 символов. Только текст сообщения.""",
                 max_tokens=150,
@@ -436,7 +449,7 @@ class ClientManagerAgent(BaseAgent):
             try:
                 await self.call_haiku(
                     system="Пишешь вежливую просьбу об отзыве.",
-                    user=f"Попроси покупателя {order.buyer_name} оставить отзыв о покупке на Avito. 80 символов max.",
+                    user=f"Попроси покупателя {order.buyer_name} оставить отзыв на Avito. 80 символов max.",
                     max_tokens=120,
                 )
                 requested += 1
@@ -452,14 +465,13 @@ class ClientManagerAgent(BaseAgent):
     # ── Escalation ─────────────────────────────────────────────
 
     async def _escalate(self, msg: dict, reason: str) -> None:
-        alert = (
+        await self.report_to_telegram(
             f"🚨 *Client Manager — Эскалация*\n"
             f"Причина: `{reason}`\n"
-            f"Покупатель: {msg.get('buyer_name', 'неизвестно')}\n"
+            f"Покупатель: {msg.get('buyer_name', '?')}\n"
             f"Товар: {msg.get('listing_title', '?')}\n"
             f"Сообщение: {msg.get('text', '')[:200]}"
         )
-        await self.report_to_telegram(alert)
 
     # ── DB helpers ─────────────────────────────────────────────
 
