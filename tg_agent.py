@@ -11,9 +11,24 @@ TELEGRAM_TOKEN = os.getenv("CLIENT_BOT_TOKEN")
 ANTHROPIC_KEY = os.getenv("ANTHROPIC_API_KEY")
 OWNER_CHAT_ID = int(os.getenv("TELEGRAM_OWNER_CHAT_ID", "5016220108"))
 N8N_INVENTORY_URL = "https://tywer1265.app.n8n.cloud/webhook/inventory"
+N8N_ORDERS_URL = "https://tywer1265.app.n8n.cloud/webhook/orders/new"
+
+# Фразы подтверждения покупки
+PURCHASE_KEYWORDS = [
+    "беру", "покупаю", "оформляю", "оформи", "давайте оформим",
+    "договорились", "согласен", "буду брать", "хочу купить",
+    "оплачу", "оплатил", "как оплатить", "куда переводить",
+    "добавь в заказ", "оформляем",
+]
 
 client = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
 conversations = {}
+
+
+def _is_purchase(text: str) -> bool:
+    t = text.lower()
+    return any(kw in t for kw in PURCHASE_KEYWORDS)
+
 
 async def get_inventory() -> str:
     try:
@@ -25,10 +40,35 @@ async def get_inventory() -> str:
                 return "Склад временно недоступен"
             lines = []
             for item in items:
-                lines.append(f"- {item['name']} ({item['size']}): {item['price']}₽, остаток: {item['stock']} шт")
+                lines.append(
+                    f"- {item['name']} ({item['size']}): {item['price']}₽, остаток: {item['stock']} шт"
+                )
             return "\n".join(lines)
     except Exception:
         return "Склад временно недоступен"
+
+
+async def notify_sale(user_name: str, user_text: str, chat_id: int) -> None:
+    """Стреляем в n8n → Google Sheets."""
+    from datetime import datetime
+    payload = {
+        "date": datetime.now().strftime("%d.%m"),
+        "name": "",        # агент не знает точно какой товар — оставляем пустым
+        "size": "",
+        "status": "Ожидает отправки",
+        "price": 0,
+        "article": "",
+        "buyer": user_name,
+        "chat_id": str(chat_id),
+    }
+    try:
+        async with httpx.AsyncClient(timeout=10) as http:
+            resp = await http.post(N8N_ORDERS_URL, json=payload)
+            if resp.status_code == 200:
+                print(f"[sale] записан заказ от {user_name}")
+    except Exception as e:
+        print(f"[sale] ошибка webhook: {e}")
+
 
 async def build_system_prompt() -> str:
     inventory = await get_inventory()
@@ -47,8 +87,10 @@ async def build_system_prompt() -> str:
 7. Если покупатель грубит — вежливо но твёрдо отвечай
 8. При эскалации (возврат, конфликт) — напиши "ЭСКАЛАЦИЯ:" в начале ответа
 9. Если товара нет в списке — честно скажи что нет в наличии
+10. Когда покупатель подтверждает покупку — напиши "ПОКУПКА:" в начале ответа, затем уточни детали доставки
 
 СТИЛЬ: дружелюбный, живой, не роботизированный"""
+
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
@@ -58,10 +100,12 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Чем могу помочь? 😊"
     )
 
+
 async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     conversations[chat_id] = []
     await update.message.reply_text("🔄 Диалог сброшен. Начинаем заново!")
+
 
 async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.id != OWNER_CHAT_ID:
@@ -73,6 +117,7 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"• Активных диалогов: {chats}\n"
         f"• Всего сообщений: {total}"
     )
+
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
@@ -109,6 +154,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "content": reply
         })
 
+        # Детект покупки — либо покупатель написал "беру", либо агент ответил "ПОКУПКА:"
+        is_sale = _is_purchase(user_text) or reply.startswith("ПОКУПКА:")
+
         if reply.startswith("ЭСКАЛАЦИЯ:"):
             clean_reply = reply.replace("ЭСКАЛАЦИЯ:", "").strip()
             await update.message.reply_text(clean_reply)
@@ -116,12 +164,29 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 chat_id=OWNER_CHAT_ID,
                 text=f"🚨 ЭСКАЛАЦИЯ от {user_name}!\n\nСообщение: {user_text}\n\nОтвет: {clean_reply}"
             )
+
+        elif is_sale:
+            clean_reply = reply.replace("ПОКУПКА:", "").strip()
+            await update.message.reply_text(clean_reply)
+
+            # Пишем в Sheets
+            await notify_sale(user_name, user_text, chat_id)
+
+            # Алерт владельцу
+            await context.bot.send_message(
+                chat_id=OWNER_CHAT_ID,
+                text=f"🛍 Новый заказ!\n"
+                     f"Покупатель: {user_name}\n"
+                     f"Сообщение: {user_text}\n"
+                     f"⚠️ Уточни товар и цену в таблице"
+            )
         else:
             await update.message.reply_text(reply)
 
     except Exception as e:
         await update.message.reply_text("Секунду, уточню информацию и отвечу! 🙏")
         print(f"Error: {e}")
+
 
 def main():
     print("🤖 Запуск Telegram агента...")
@@ -132,6 +197,7 @@ def main():
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     print("✅ Агент запущен! Пиши боту в Telegram.")
     app.run_polling(drop_pending_updates=True)
+
 
 if __name__ == "__main__":
     main()
