@@ -2,16 +2,21 @@ import os
 import re
 import httpx
 import base64
-from datetime import datetime
-from telegram import Update, Message
+import asyncpg
+from datetime import datetime, timezone
+from telegram import Update
 from telegram.ext import Application, MessageHandler, CommandHandler, filters, ContextTypes
 import anthropic
 
 TELEGRAM_TOKEN = os.getenv("CLIENT_BOT_TOKEN")
 ANTHROPIC_KEY = os.getenv("ANTHROPIC_API_KEY")
 OWNER_CHAT_ID = int(os.getenv("TELEGRAM_OWNER_CHAT_ID", "5016220108"))
+DATABASE_URL = os.getenv("DATABASE_URL", "").replace("postgresql+asyncpg://", "postgresql://")
 N8N_INVENTORY_URL = "https://tywer1265.app.n8n.cloud/webhook/inventory"
 N8N_ORDERS_URL = "https://tywer1265.app.n8n.cloud/webhook/orders/new"
+
+# Антиспам: максимум сообщений в минуту
+MAX_MESSAGES_PER_MINUTE = 10
 
 PURCHASE_KEYWORDS = [
     "беру", "покупаю", "оформляю", "оформи", "давайте оформим",
@@ -21,9 +26,99 @@ PURCHASE_KEYWORDS = [
 ]
 
 client = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
-conversations = {}
 order_context = {}
+spam_counter = {}  # chat_id -> [timestamps]
+db_pool = None
 
+
+# ── База данных ────────────────────────────────────────────────
+
+async def init_db():
+    global db_pool
+    if not DATABASE_URL:
+        print("[db] DATABASE_URL не задан — память отключена")
+        return
+    try:
+        db_pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=5)
+        # Создаём таблицу истории TG диалогов если нет
+        async with db_pool.acquire() as conn:
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS tg_conversations (
+                    id BIGSERIAL PRIMARY KEY,
+                    chat_id BIGINT NOT NULL,
+                    role VARCHAR(16) NOT NULL,
+                    content TEXT NOT NULL,
+                    created_at TIMESTAMPTZ DEFAULT NOW()
+                )
+            """)
+            await conn.execute("""
+                CREATE INDEX IF NOT EXISTS idx_tg_conv_chat_id 
+                ON tg_conversations(chat_id, created_at DESC)
+            """)
+        print("[db] Подключено, таблица tg_conversations готова")
+    except Exception as e:
+        print(f"[db] Ошибка подключения: {e}")
+        db_pool = None
+
+
+async def load_history(chat_id: int, limit: int = 20) -> list:
+    if not db_pool:
+        return []
+    try:
+        async with db_pool.acquire() as conn:
+            rows = await conn.fetch("""
+                SELECT role, content FROM (
+                    SELECT role, content, created_at
+                    FROM tg_conversations
+                    WHERE chat_id = $1
+                    ORDER BY created_at DESC
+                    LIMIT $2
+                ) sub ORDER BY created_at ASC
+            """, chat_id, limit)
+            return [{"role": r["role"], "content": r["content"]} for r in rows]
+    except Exception as e:
+        print(f"[db] load_history error: {e}")
+        return []
+
+
+async def save_message(chat_id: int, role: str, content: str):
+    if not db_pool:
+        return
+    try:
+        async with db_pool.acquire() as conn:
+            await conn.execute("""
+                INSERT INTO tg_conversations (chat_id, role, content)
+                VALUES ($1, $2, $3)
+            """, chat_id, role, content)
+    except Exception as e:
+        print(f"[db] save_message error: {e}")
+
+
+async def clear_history(chat_id: int):
+    if not db_pool:
+        return
+    try:
+        async with db_pool.acquire() as conn:
+            await conn.execute(
+                "DELETE FROM tg_conversations WHERE chat_id = $1", chat_id
+            )
+    except Exception as e:
+        print(f"[db] clear_history error: {e}")
+
+
+# ── Антиспам ───────────────────────────────────────────────────
+
+def is_spam(chat_id: int) -> bool:
+    now = datetime.now().timestamp()
+    if chat_id not in spam_counter:
+        spam_counter[chat_id] = []
+    # Оставляем только последнюю минуту
+    spam_counter[chat_id] = [t for t in spam_counter[chat_id] if now - t < 60]
+    spam_counter[chat_id].append(now)
+    return len(spam_counter[chat_id]) > MAX_MESSAGES_PER_MINUTE
+
+
+# ── Утилиты ────────────────────────────────────────────────────
 
 def _is_purchase(text: str) -> bool:
     return any(kw in text.lower() for kw in PURCHASE_KEYWORDS)
@@ -81,7 +176,6 @@ async def get_inventory() -> tuple[str, list]:
 
 
 async def analyze_photo(photo_bytes: bytes, inventory_text: str) -> str:
-    """Анализируем фото через Claude Vision и ищем похожее в складе."""
     image_data = base64.standard_b64encode(photo_bytes).decode("utf-8")
     try:
         response = client.messages.create(
@@ -99,22 +193,15 @@ async def analyze_photo(photo_bytes: bytes, inventory_text: str) -> str:
 3. Предложи его покупателю коротко и по делу
 4. Если похожего нет — честно скажи и предложи альтернативу
 
-Отвечай на русском, 2-3 предложения максимум.""",
+Отвечай на русском, 2-3 предложения. Без звёздочек и форматирования.""",
             messages=[{
                 "role": "user",
                 "content": [
                     {
                         "type": "image",
-                        "source": {
-                            "type": "base64",
-                            "media_type": "image/jpeg",
-                            "data": image_data,
-                        }
+                        "source": {"type": "base64", "media_type": "image/jpeg", "data": image_data}
                     },
-                    {
-                        "type": "text",
-                        "text": "Что это за одежда и есть ли у вас похожее?"
-                    }
+                    {"type": "text", "text": "Что это за одежда и есть ли у вас похожее?"}
                 ]
             }]
         )
@@ -144,59 +231,88 @@ async def notify_sale(user_name: str, chat_id: int) -> dict:
     return payload
 
 
-async def build_system_prompt(inventory_text: str) -> str:
-    return f"""Ты — менеджер по продажам одежды LOCAL Store. Отвечай покупателям вежливо, коротко и по делу.
+def build_system_prompt(inventory_text: str) -> str:
+    return f"""Ты — менеджер магазина одежды LOCAL Store. Твоя цель — чтобы каждый покупатель был счастлив на 1000%.
 
-ТОВАРЫ В НАЛИЧИИ (актуально):
+ТОВАРЫ В НАЛИЧИИ:
 {inventory_text}
 
-ПРАВИЛА:
+О ТОВАРАХ:
+Все товары — реплики премиум качества.
+Футболки: 100% хлопок, ткань пенье-компакт, оверсайз крой, принт DTF (держится вечно), плотная.
+Худи и свитшоты: 80% хлопок 20% полиэстер, ткань футер, плотные, принт везде одинакового качества.
+Лонгсливы: качество как у футболок.
+Поло (короткий и длинный рукав): 100% хлопок, ткань пике, премиум качество.
+Размеры: от XXS до 3XL.
+Можем нанести принт на заказ — от 3 рабочих дней.
+Уход: стирка 30-40°С деликатный режим, сушить в расправленном виде, гладить изнаночную сторону, не отбеливать.
+
+ДОСТАВКА:
+Отправка в течение 2 дней после оплаты.
+Способы: Яндекс доставка, СДЭК, Почта России, Авито доставка, курьер по Москве и МО, самовывоз Москва.
+
+ОПЛАТА:
+Перевод на Тинькофф: Артём А., карта 2200700986188158 или по номеру +79776810910.
+Либо через Авито при покупке там.
+
+ВОЗВРАТ И ГАРАНТИЯ:
+Возврат в течение 14 дней.
+Гарантия на товары 12 месяцев.
+При проблемах писать сюда или менеджеру @KROSHIDEMANAGER.
+
+ПРАВИЛА ОБЩЕНИЯ:
 1. Отвечай коротко — 1-3 предложения максимум
-2. При торге можешь снизить цену МАКСИМУМ на 10%
-3. Доставка: СДЭК 2-5 дней, Почта России 5-10 дней, самовывоз Москва
-4. Если спрашивают про размер — уточни рост и вес покупателя
-5. Всегда заканчивай вопросом или призывом к действию
-6. Пиши как живой человек, без официоза
+2. Пиши как живой человек — дружелюбно, тепло, без официоза
+3. Никакого форматирования — никаких звёздочек, решёток, тире в начале строк
+4. При торге можешь снизить цену максимум на 10%
+5. Если спрашивают про размер — уточни рост и вес, подбери оптимальный
+6. Всегда заканчивай вопросом или призывом к действию
 7. Если покупатель грубит — вежливо но твёрдо отвечай
-8. При эскалации (возврат, конфликт) — напиши "ЭСКАЛАЦИЯ:" в начале ответа
-9. Если товара нет в списке — честно скажи что нет в наличии
-10. Когда покупатель подтверждает покупку — напиши "ПОКУПКА:" в начале ответа, затем уточни детали доставки
+8. При эскалации (возврат, конфликт) — напиши ЭСКАЛАЦИЯ: в начале ответа
+9. Если товара нет — честно скажи и предложи альтернативу
+10. Когда покупатель подтверждает покупку — напиши ПОКУПКА: в начале ответа, затем уточни способ доставки и отправь реквизиты для оплаты
+11. После оплаты — поблагодари, скажи что отправишь в течение 2 дней и дашь трек-номер
+12. Всегда давай ощущение что покупатель делает отличный выбор
+13. Помни историю диалога — если покупатель возвращается, обращайся к предыдущему разговору"""
 
-СТИЛЬ: дружелюбный, живой, не роботизированный"""
 
+# ── Хендлеры ───────────────────────────────────────────────────
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
-    conversations[chat_id] = []
+    await clear_history(chat_id)
     order_context[chat_id] = {"name": "", "size": "", "price": 0, "article": ""}
-    await update.message.reply_text("👋 Привет! Я менеджер магазина LOCAL Store.\n\nЧем могу помочь? 😊")
+    await update.message.reply_text(
+        "Привет! Я менеджер магазина LOCAL Store.\n\nУ нас большой выбор брендовой одежды — Bape, CDG, Y3, Гоша Рубчинский и другие. Чем могу помочь? 😊"
+    )
 
 
 async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
-    conversations[chat_id] = []
+    await clear_history(chat_id)
     order_context[chat_id] = {"name": "", "size": "", "price": 0, "article": ""}
-    await update.message.reply_text("🔄 Диалог сброшен. Начинаем заново!")
+    await update.message.reply_text("Диалог сброшен. Начинаем заново!")
 
 
 async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.id != OWNER_CHAT_ID:
         return
-    total = sum(len(v) for v in conversations.values())
     await update.message.reply_text(
-        f"📊 Статистика:\n• Активных диалогов: {len(conversations)}\n• Всего сообщений: {total}"
+        f"Статистика:\nАктивных контекстов: {len(order_context)}\nПамять: {'PostgreSQL' if db_pool else 'отключена'}"
     )
 
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработка фото от покупателя."""
     chat_id = update.effective_chat.id
     user_name = update.effective_user.first_name or "Покупатель"
+
+    if is_spam(chat_id):
+        await update.message.reply_text("Чуть помедленнее! Отвечу на все вопросы по очереди 😊")
+        return
 
     await context.bot.send_chat_action(chat_id=chat_id, action="typing")
 
     try:
-        # Берём фото максимального размера
         photo = update.message.photo[-1]
         file = await context.bot.get_file(photo.file_id)
 
@@ -207,13 +323,10 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         inventory_text, inventory_items = await get_inventory()
         reply = await analyze_photo(photo_bytes, inventory_text)
 
-        # Обновляем контекст из ответа агента
         _update_order_context(chat_id, reply, inventory_items)
 
-        if chat_id not in conversations:
-            conversations[chat_id] = []
-        conversations[chat_id].append({"role": "user", "content": f"{user_name}: [прислал фото]"})
-        conversations[chat_id].append({"role": "assistant", "content": reply})
+        await save_message(chat_id, "user", f"{user_name}: [прислал фото]")
+        await save_message(chat_id, "assistant", reply)
 
         await update.message.reply_text(reply)
 
@@ -227,29 +340,40 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_text = update.message.text
     user_name = update.effective_user.first_name or "Покупатель"
 
-    if chat_id not in conversations:
-        conversations[chat_id] = []
+    # Антиспам
+    if is_spam(chat_id):
+        await update.message.reply_text("Чуть помедленнее! Отвечу на все вопросы по очереди 😊")
+        return
 
     inventory_text, inventory_items = await get_inventory()
     _update_order_context(chat_id, user_text, inventory_items)
 
-    conversations[chat_id].append({"role": "user", "content": f"{user_name}: {user_text}"})
-    if len(conversations[chat_id]) > 20:
-        conversations[chat_id] = conversations[chat_id][-20:]
+    # Загружаем историю из БД
+    history = await load_history(chat_id)
+    history.append({"role": "user", "content": f"{user_name}: {user_text}"})
+    if len(history) > 20:
+        history = history[-20:]
 
     await context.bot.send_chat_action(chat_id=chat_id, action="typing")
 
     try:
+        # Торг → Sonnet, остальное → Haiku
+        is_negotiation = any(w in user_text.lower() for w in ["скидк", "дешевле", "уступ", "торг", "снизь"])
+        model = "claude-sonnet-4-6" if is_negotiation else "claude-haiku-4-5-20251001"
+
         response = client.messages.create(
-            model="claude-haiku-4-5-20251001",
+            model=model,
             max_tokens=300,
-            system=await build_system_prompt(inventory_text),
-            messages=conversations[chat_id]
+            system=build_system_prompt(inventory_text),
+            messages=history
         )
         reply = response.content[0].text
 
         _update_order_context(chat_id, reply, inventory_items)
-        conversations[chat_id].append({"role": "assistant", "content": reply})
+
+        # Сохраняем в БД
+        await save_message(chat_id, "user", f"{user_name}: {user_text}")
+        await save_message(chat_id, "assistant", reply)
 
         is_sale = _is_purchase(user_text) or reply.startswith("ПОКУПКА:")
 
@@ -258,20 +382,20 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(clean)
             await context.bot.send_message(
                 chat_id=OWNER_CHAT_ID,
-                text=f"🚨 ЭСКАЛАЦИЯ от {user_name}!\nСообщение: {user_text}\nОтвет: {clean}"
+                text=f"ЭСКАЛАЦИЯ от {user_name}!\nСообщение: {user_text}\nОтвет: {clean}"
             )
         elif is_sale:
             clean = reply.replace("ПОКУПКА:", "").strip()
             await update.message.reply_text(clean)
             order = await notify_sale(user_name, chat_id)
-            status = "✅ Записано в таблицу" if order["name"] else "⚠️ Товар не определён — проверь таблицу"
+            status = "Записано в таблицу" if order["name"] else "Товар не определён — проверь таблицу"
             await context.bot.send_message(
                 chat_id=OWNER_CHAT_ID,
-                text=f"🛍 Новый заказ!\n"
+                text=f"Новый заказ!\n"
                      f"Покупатель: {user_name}\n"
                      f"Товар: {order['name'] or '?'}\n"
                      f"Размер: {order['size'] or '?'}\n"
-                     f"Цена: {order['price'] or '?'} ₽\n"
+                     f"Цена: {order['price'] or '?'} руб.\n"
                      f"Артикул: {order['article'] or '?'}\n"
                      f"{status}"
             )
@@ -279,19 +403,24 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(reply)
 
     except Exception as e:
-        await update.message.reply_text("Секунду, уточню информацию и отвечу! 🙏")
+        await update.message.reply_text("Секунду, уточню информацию и отвечу!")
         print(f"Error: {e}")
 
 
 def main():
-    print("🤖 Запуск Telegram агента...")
-    app = Application.builder().token(TELEGRAM_TOKEN).build()
+    import asyncio
+
+    async def post_init(app):
+        await init_db()
+
+    print("Запуск Telegram агента...")
+    app = Application.builder().token(TELEGRAM_TOKEN).post_init(post_init).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("reset", reset))
     app.add_handler(CommandHandler("stats", stats))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    print("✅ Агент запущен!")
+    print("Агент запущен!")
     app.run_polling(drop_pending_updates=True)
 
 
