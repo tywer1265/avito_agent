@@ -2,6 +2,7 @@ import asyncio
 import os
 import json
 import httpx
+from datetime import datetime
 from telegram import Update
 from telegram.ext import Application, MessageHandler, CommandHandler, filters, ContextTypes
 import anthropic
@@ -13,12 +14,11 @@ OWNER_CHAT_ID = int(os.getenv("TELEGRAM_OWNER_CHAT_ID", "5016220108"))
 N8N_INVENTORY_URL = "https://tywer1265.app.n8n.cloud/webhook/inventory"
 N8N_ORDERS_URL = "https://tywer1265.app.n8n.cloud/webhook/orders/new"
 
-# Фразы подтверждения покупки
 PURCHASE_KEYWORDS = [
     "беру", "покупаю", "оформляю", "оформи", "давайте оформим",
     "договорились", "согласен", "буду брать", "хочу купить",
     "оплачу", "оплатил", "как оплатить", "куда переводить",
-    "добавь в заказ", "оформляем",
+    "добавь в заказ", "оформляем", "подходит",
 ]
 
 client = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
@@ -48,26 +48,58 @@ async def get_inventory() -> str:
         return "Склад временно недоступен"
 
 
-async def notify_sale(user_name: str, user_text: str, chat_id: int) -> None:
-    """Стреляем в n8n → Google Sheets."""
-    from datetime import datetime
+async def extract_order_from_dialog(history: list) -> dict:
+    """Вытаскиваем товар, размер и цену из истории диалога через Haiku."""
+    dialog_text = "\n".join(
+        f"{m['role']}: {m['content']}" for m in history[-10:]
+    )
+    try:
+        response = client.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=150,
+            system="Ты извлекаешь данные заказа из диалога. Отвечай ТОЛЬКО валидным JSON без markdown.",
+            messages=[{
+                "role": "user",
+                "content": f"""Из этого диалога извлеки данные последнего заказа:
+
+{dialog_text}
+
+Верни JSON:
+{{"name": "название товара", "size": "размер", "price": 0}}
+
+Если не можешь определить — оставь пустую строку или 0."""
+            }]
+        )
+        raw = response.content[0].text.strip()
+        return json.loads(raw)
+    except Exception:
+        return {"name": "", "size": "", "price": 0}
+
+
+async def notify_sale(user_name: str, chat_id: int, history: list) -> dict:
+    """Вытаскиваем данные из диалога и пишем в Sheets через n8n."""
+    order = await extract_order_from_dialog(history)
+
     payload = {
         "date": datetime.now().strftime("%d.%m"),
-        "name": "",        # агент не знает точно какой товар — оставляем пустым
-        "size": "",
+        "name": order.get("name", ""),
+        "size": order.get("size", ""),
         "status": "Ожидает отправки",
-        "price": 0,
+        "price": order.get("price", 0),
+        "cost": "",
         "article": "",
         "buyer": user_name,
-        "chat_id": str(chat_id),
     }
+
     try:
         async with httpx.AsyncClient(timeout=10) as http:
             resp = await http.post(N8N_ORDERS_URL, json=payload)
             if resp.status_code == 200:
-                print(f"[sale] записан заказ от {user_name}")
+                print(f"[sale] записан заказ: {payload['name']} {payload['size']} {payload['price']}₽")
     except Exception as e:
         print(f"[sale] ошибка webhook: {e}")
+
+    return payload
 
 
 async def build_system_prompt() -> str:
@@ -96,8 +128,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     conversations[chat_id] = []
     await update.message.reply_text(
-        "👋 Привет! Я менеджер магазина LOCAL Store.\n\n"
-        "Чем могу помочь? 😊"
+        "👋 Привет! Я менеджер магазина LOCAL Store.\n\nЧем могу помочь? 😊"
     )
 
 
@@ -111,10 +142,9 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.id != OWNER_CHAT_ID:
         return
     total = sum(len(v) for v in conversations.values())
-    chats = len(conversations)
     await update.message.reply_text(
         f"📊 Статистика:\n"
-        f"• Активных диалогов: {chats}\n"
+        f"• Активных диалогов: {len(conversations)}\n"
         f"• Всего сообщений: {total}"
     )
 
@@ -154,7 +184,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "content": reply
         })
 
-        # Детект покупки — либо покупатель написал "беру", либо агент ответил "ПОКУПКА:"
         is_sale = _is_purchase(user_text) or reply.startswith("ПОКУПКА:")
 
         if reply.startswith("ЭСКАЛАЦИЯ:"):
@@ -169,16 +198,17 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             clean_reply = reply.replace("ПОКУПКА:", "").strip()
             await update.message.reply_text(clean_reply)
 
-            # Пишем в Sheets
-            await notify_sale(user_name, user_text, chat_id)
+            # Вытаскиваем данные из диалога и пишем в Sheets
+            order = await notify_sale(user_name, chat_id, conversations[chat_id])
 
-            # Алерт владельцу
             await context.bot.send_message(
                 chat_id=OWNER_CHAT_ID,
                 text=f"🛍 Новый заказ!\n"
                      f"Покупатель: {user_name}\n"
-                     f"Сообщение: {user_text}\n"
-                     f"⚠️ Уточни товар и цену в таблице"
+                     f"Товар: {order['name'] or '?'}\n"
+                     f"Размер: {order['size'] or '?'}\n"
+                     f"Цена: {order['price'] or '?'} ₽\n"
+                     f"{'⚠️ Проверь таблицу — данные могут быть неполными' if not order['name'] else '✅ Записано в таблицу'}"
             )
         else:
             await update.message.reply_text(reply)
@@ -195,7 +225,7 @@ def main():
     app.add_handler(CommandHandler("reset", reset))
     app.add_handler(CommandHandler("stats", stats))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    print("✅ Агент запущен! Пиши боту в Telegram.")
+    print("✅ Агент запущен!")
     app.run_polling(drop_pending_updates=True)
 
 
