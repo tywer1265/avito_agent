@@ -1,9 +1,9 @@
 import os
-import json
 import re
 import httpx
+import base64
 from datetime import datetime
-from telegram import Update
+from telegram import Update, Message
 from telegram.ext import Application, MessageHandler, CommandHandler, filters, ContextTypes
 import anthropic
 
@@ -41,7 +41,6 @@ def _update_order_context(chat_id: int, text: str, inventory: list) -> None:
         order_context[chat_id] = {"name": "", "size": "", "price": 0, "article": ""}
 
     text_lower = text.lower()
-
     for item in inventory:
         item_name = item.get("name", "")
         if item_name.lower() in text_lower or any(
@@ -81,6 +80,50 @@ async def get_inventory() -> tuple[str, list]:
         return "Склад временно недоступен", []
 
 
+async def analyze_photo(photo_bytes: bytes, inventory_text: str) -> str:
+    """Анализируем фото через Claude Vision и ищем похожее в складе."""
+    image_data = base64.standard_b64encode(photo_bytes).decode("utf-8")
+    try:
+        response = client.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=400,
+            system=f"""Ты — менеджер магазина одежды LOCAL Store.
+Покупатель прислал фото одежды которую хочет купить.
+
+НАШИ ТОВАРЫ В НАЛИЧИИ:
+{inventory_text}
+
+Твоя задача:
+1. Определи что на фото (тип одежды, бренд, стиль, цвет)
+2. Найди максимально похожий товар из нашего склада
+3. Предложи его покупателю коротко и по делу
+4. Если похожего нет — честно скажи и предложи альтернативу
+
+Отвечай на русском, 2-3 предложения максимум.""",
+            messages=[{
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image",
+                        "source": {
+                            "type": "base64",
+                            "media_type": "image/jpeg",
+                            "data": image_data,
+                        }
+                    },
+                    {
+                        "type": "text",
+                        "text": "Что это за одежда и есть ли у вас похожее?"
+                    }
+                ]
+            }]
+        )
+        return response.content[0].text
+    except Exception as e:
+        print(f"[vision] error: {e}")
+        return "Не смог распознать фото. Опишите словами что ищете — помогу найти!"
+
+
 async def notify_sale(user_name: str, chat_id: int) -> dict:
     ctx = order_context.get(chat_id, {})
     payload = {
@@ -96,7 +139,6 @@ async def notify_sale(user_name: str, chat_id: int) -> dict:
     try:
         async with httpx.AsyncClient(timeout=10) as http:
             await http.post(N8N_ORDERS_URL, json=payload)
-            print(f"[sale] {payload['name']} {payload['size']} {payload['price']}₽ арт:{payload['article']}")
     except Exception as e:
         print(f"[sale] webhook error: {e}")
     return payload
@@ -146,6 +188,40 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработка фото от покупателя."""
+    chat_id = update.effective_chat.id
+    user_name = update.effective_user.first_name or "Покупатель"
+
+    await context.bot.send_chat_action(chat_id=chat_id, action="typing")
+
+    try:
+        # Берём фото максимального размера
+        photo = update.message.photo[-1]
+        file = await context.bot.get_file(photo.file_id)
+
+        async with httpx.AsyncClient(timeout=15) as http:
+            resp = await http.get(file.file_path)
+            photo_bytes = resp.content
+
+        inventory_text, inventory_items = await get_inventory()
+        reply = await analyze_photo(photo_bytes, inventory_text)
+
+        # Обновляем контекст из ответа агента
+        _update_order_context(chat_id, reply, inventory_items)
+
+        if chat_id not in conversations:
+            conversations[chat_id] = []
+        conversations[chat_id].append({"role": "user", "content": f"{user_name}: [прислал фото]"})
+        conversations[chat_id].append({"role": "assistant", "content": reply})
+
+        await update.message.reply_text(reply)
+
+    except Exception as e:
+        print(f"[photo] error: {e}")
+        await update.message.reply_text("Не смог обработать фото. Опишите словами что ищете!")
+
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     user_text = update.message.text
@@ -187,7 +263,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         elif is_sale:
             clean = reply.replace("ПОКУПКА:", "").strip()
             await update.message.reply_text(clean)
-
             order = await notify_sale(user_name, chat_id)
             status = "✅ Записано в таблицу" if order["name"] else "⚠️ Товар не определён — проверь таблицу"
             await context.bot.send_message(
@@ -214,6 +289,7 @@ def main():
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("reset", reset))
     app.add_handler(CommandHandler("stats", stats))
+    app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     print("✅ Агент запущен!")
     app.run_polling(drop_pending_updates=True)
