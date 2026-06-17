@@ -759,7 +759,6 @@ def main():
                 MessageHandler(filters.TEXT & filters.REPLY, handle_owner_reply)
             )
 
-        # Запускаем оба
         await client_app.initialize()
         await client_app.start()
         await client_app.updater.start_polling(drop_pending_updates=True)
@@ -770,9 +769,8 @@ def main():
             await owner_app.updater.start_polling(drop_pending_updates=True)
             print("Оба бота запущены")
         else:
-            print("Бот покупателей запущен (токен владельца не найден)")
+            print("Бот покупателей запущен")
 
-        # Держим процесс живым
         try:
             await asyncio.Event().wait()
         finally:
@@ -784,7 +782,10 @@ def main():
                 await owner_app.stop()
                 await owner_app.shutdown()
 
-    asyncio.run(run())
+    # Запускаем в новом event loop (для совместимости с threading из main.py)
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    loop.run_until_complete(run())
 
 
 if __name__ == "__main__":
