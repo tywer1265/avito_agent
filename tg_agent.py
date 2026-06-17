@@ -2,6 +2,7 @@ import os
 import re
 import httpx
 import base64
+import asyncio
 import asyncpg
 from datetime import datetime, timezone
 from telegram import Update
@@ -26,6 +27,7 @@ PURCHASE_KEYWORDS = [
 client = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
 order_context = {}
 spam_counter = {}
+followup_tasks = {}  # chat_id → asyncio.Task
 db_pool = None
 _inventory_cache: tuple[str, list, float] = ("", [], 0.0)
 
@@ -295,6 +297,39 @@ async def analyze_photo(photo_bytes: bytes, inventory_text: str) -> str:
         return "Не смог распознать фото. Опишите словами что ищете — помогу найти!"
 
 
+async def send_followup(bot, chat_id: int) -> None:
+    """Отправляет followup через 2 часа если покупатель не ответил."""
+    try:
+        await asyncio.sleep(2 * 60 * 60)  # 2 часа
+        # Проверяем что задача не была отменена
+        if chat_id in followup_tasks:
+            await bot.send_message(
+                chat_id=chat_id,
+                text="Добрый день! Хотел уточнить — всё ли в порядке с оплатой? Если возникли вопросы — напишите, помогу 😊"
+            )
+            del followup_tasks[chat_id]
+    except asyncio.CancelledError:
+        pass
+    except Exception as e:
+        print(f"[followup] error: {e}")
+
+
+def schedule_followup(bot, chat_id: int) -> None:
+    """Запускает таймер followup, отменяет предыдущий если был."""
+    cancel_followup(chat_id)
+    task = asyncio.create_task(send_followup(bot, chat_id))
+    followup_tasks[chat_id] = task
+    print(f"[followup] запланирован для {chat_id}")
+
+
+def cancel_followup(chat_id: int) -> None:
+    """Отменяет таймер followup если покупатель ответил."""
+    if chat_id in followup_tasks:
+        followup_tasks[chat_id].cancel()
+        del followup_tasks[chat_id]
+        print(f"[followup] отменён для {chat_id}")
+
+
 async def notify_client(user: object, chat_id: int) -> None:
     """Отправляет данные клиента в n8n CRM при каждом новом сообщении."""
     ctx = order_context.get(chat_id, {})
@@ -470,6 +505,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Чуть помедленнее, отвечу на все вопросы по очереди 😊")
         return
 
+    # Покупатель написал — отменяем followup если был запущен
+    cancel_followup(chat_id)
+
     inventory_text, inventory_items = await get_inventory()
     _update_order_context(chat_id, user_text, inventory_items)
 
@@ -511,6 +549,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         elif is_sale:
             clean = reply.replace("ПОКУПКА:", "").strip()
             await update.message.reply_text(clean)
+            cancel_followup(chat_id)  # Оплатил — followup не нужен
             order = await notify_sale(user_name, chat_id)
             ctx = order_context.get(chat_id, {})
             status = "✅ Записано в таблицу" if order["name"] else "⚠️ Товар не определён — проверь таблицу"
@@ -531,6 +570,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         else:
             await update.message.reply_text(reply)
+            # Запускаем followup если бот отправил реквизиты для оплаты
+            requisites_sent = any(w in reply for w in ["2200700986188158", "переводи", "Переводи", "карту", "на карт"])
+            if requisites_sent:
+                schedule_followup(context.bot, chat_id)
 
     except Exception as e:
         await update.message.reply_text("Секунду, уточню информацию и отвечу!")
