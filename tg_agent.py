@@ -6,8 +6,8 @@ import base64
 import asyncio
 import asyncpg
 from datetime import datetime, timezone
-from telegram import Update
-from telegram.ext import Application, MessageHandler, CommandHandler, filters, ContextTypes
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, MessageHandler, CommandHandler, CallbackQueryHandler, filters, ContextTypes
 import anthropic
 
 TELEGRAM_TOKEN = os.getenv("CLIENT_BOT_TOKEN")
@@ -448,11 +448,18 @@ def build_system_prompt(inventory_text: str) -> str:
 Уход: стирка 30-40°С деликатный режим, сушить в расправленном виде, гладить изнаночную сторону, не отбеливать.
 
 ДОСТАВКА:
-Отправка в течение 2 дней после оплаты.
-Способы: Яндекс доставка, СДЭК, Почта России, Авито доставка, курьер по Москве и МО, самовывоз Москва.
+Отправка в течение 3 дней после оплаты.
+Способы доставки:
+- Яндекс доставка
+- СДЭК
+- Почта России
+- Авито доставка
+- Курьер по Москве и МО — стоимость от 500 рублей. Если покупатель хочет курьера — попроси адрес и скажи что уточнишь точную стоимость
+- Самовывоз: Москва, ул. Кржижановского 23к2. Это пункт выдачи, не шоурум. Все заказы выдаются по заявкам. Возможна оплата при получении.
 
 ОПЛАТА:
 Перевод на Тинькофф: Артём А., карта 2200700986188158 или по номеру +79776810910.
+При самовывозе возможна оплата при получении.
 Либо через Авито при покупке там.
 
 ВОЗВРАТ И ГАРАНТИЯ:
@@ -499,7 +506,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     order_context[chat_id] = {
         "name": "", "size": "", "price": 0, "cost": 0, "article": "",
         "recipient_name": "", "recipient_address": "", "recipient_phone": "",
-        "state": "idle"
+        "delivery": "", "state": "idle"
     }
     await update.message.reply_text(
         "Здравствуйте! Добро пожаловать в LOCAL Store 😊 У нас большой выбор одежды от топовых брендов — Bape, CDG, Y3, Гоша Рубчинский и другие. Что Вас интересует?"
@@ -512,12 +519,52 @@ async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
     order_context[chat_id] = {
         "name": "", "size": "", "price": 0, "cost": 0, "article": "",
         "recipient_name": "", "recipient_address": "", "recipient_phone": "",
-        "state": "idle"
+        "delivery": "", "state": "idle"
     }
     await update.message.reply_text("Диалог сброшен. Начинаем заново!")
 
 
-async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def handle_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик кнопки подтверждения заказа."""
+    query = update.callback_query
+    await query.answer()
+
+    chat_id = query.from_user.id
+    if not query.data.startswith("confirm_"):
+        return
+
+    ctx = order_context.get(chat_id, {})
+    price = ctx.get("price", 0)
+    delivery = ctx.get("delivery", "не указан")
+
+    order_context[chat_id]["state"] = "idle"
+
+    # Реквизиты для оплаты
+    if delivery == "Самовывоз":
+        reply = (
+            f"Отлично, заказ подтверждён! 😊\n\n"
+            f"Адрес самовывоза: Москва, ул. Кржижановского 23к2\n"
+            f"Сумма: {price}₽\n\n"
+            f"Оплата при получении. Напишите когда будете готовы забрать — согласуем время."
+        )
+    else:
+        reply = (
+            f"Отлично, заказ подтверждён! 😊\n\n"
+            f"Перевод на Тинькофф карту: 2200700986188158\n"
+            f"Или по номеру: +79776810910\n"
+            f"Имя получателя: Артём А.\n\n"
+            f"Сумма: {price}₽\n\n"
+            f"После перевода напишите мне — сразу оформлю отправку."
+        )
+
+    await query.edit_message_text(reply)
+    await save_message(chat_id, "assistant", reply)
+    schedule_followup(context.bot, chat_id)
+
+
+async def handle_purchase_confirmed(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Покупатель написал что перевёл — фиксируем заказ."""
+    pass  # логика уже в handle_message через PURCHASE_KEYWORDS
     chat_id = update.effective_chat.id
     user_name = update.effective_user.first_name or "Покупатель"
 
@@ -604,26 +651,54 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if state == "waiting_phone":
         order_context[chat_id]["recipient_phone"] = user_text.strip()
-        order_context[chat_id]["state"] = "idle"
+        order_context[chat_id]["state"] = "waiting_confirm"
         ctx = order_context[chat_id]
         price = ctx.get("price", 0)
+        delivery = ctx.get("delivery", "не указан")
         await save_message(chat_id, "user", f"{user_name}: {user_text}")
-        reply = (
-            f"Спасибо! Вот реквизиты для оплаты:\n\n"
-            f"Перевод на Тинькофф карту: 2200700986188158\n"
-            f"Или по номеру: +79776810910\n"
-            f"Имя получателя: Артём А.\n\n"
-            f"Сумма: {price}₽\n\n"
-            f"После перевода напишите мне, и я оформлю отправку."
+
+        # Показываем сводку заказа с кнопкой подтверждения
+        summary = (
+            f"Проверьте Ваш заказ:\n\n"
+            f"Товар: {ctx.get('name') or '?'}\n"
+            f"Размер: {ctx.get('size') or '?'}\n"
+            f"Сумма: {price}₽\n"
+            f"Доставка: {delivery}\n"
+            f"ФИО: {ctx.get('recipient_name') or '?'}\n"
+            f"Адрес: {ctx.get('recipient_address') or '?'}\n"
+            f"Телефон: {ctx.get('recipient_phone') or '?'}\n\n"
+            f"Всё верно?"
         )
-        await update.message.reply_text(reply)
-        await save_message(chat_id, "assistant", reply)
-        schedule_followup(context.bot, chat_id)
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("✅ Подтвердить заказ", callback_data=f"confirm_{chat_id}")]
+        ])
+        await update.message.reply_text(summary, reply_markup=keyboard)
+        await save_message(chat_id, "assistant", summary)
+        return
+
+    if state == "waiting_confirm":
+        # Покупатель написал текст вместо кнопки — напоминаем
+        await update.message.reply_text("Пожалуйста, нажмите кнопку «Подтвердить заказ» выше 😊")
         return
     # ──────────────────────────────────────────────────────────
 
     # Синхронно обновляем товар/размер/цену
     _update_order_context_sync(chat_id, user_text, inventory_items)
+
+    # Сохраняем способ доставки если упоминается
+    delivery_map = {
+        "яндекс": "Яндекс доставка",
+        "сдэк": "СДЭК",
+        "почт": "Почта России",
+        "авито": "Авито доставка",
+        "курьер": "Курьер",
+        "самовывоз": "Самовывоз",
+        "самовыво": "Самовывоз",
+    }
+    for key, val in delivery_map.items():
+        if key in user_text.lower():
+            order_context[chat_id]["delivery"] = val
+            break
 
     # Ранняя эскалация — до ответа Claude
     ESCALATION_TRIGGERS = [
@@ -705,7 +780,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 print(f"[escalation_alert] error: {e}")
         elif is_sale:
             clean = reply.replace("ПОКУПКА:", "").strip()
-            await update.message.reply_text(clean)
+            after_payment_msg = "Спасибо за заказ! Передал его на сборку, отправка будет в течение 3х дней, ожидайте. Трек номер пришлю чуть позже! ♥️"
+            await update.message.reply_text(after_payment_msg)
             cancel_followup(chat_id)
             order = await notify_sale(user_name, chat_id)
             ctx = order_context.get(chat_id, {})
@@ -836,6 +912,7 @@ def main():
         )
         client_app.add_handler(CommandHandler("start", start))
         client_app.add_handler(CommandHandler("reset", reset))
+        client_app.add_handler(CallbackQueryHandler(handle_confirm, pattern="^confirm_"))
         client_app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
         client_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
