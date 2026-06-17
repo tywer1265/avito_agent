@@ -482,7 +482,7 @@ def build_system_prompt(inventory_text: str) -> str:
 2. Если покупатель грубит — вежливо но твёрдо отвечай
 3. При эскалации (возврат, конфликт) — напиши ЭСКАЛАЦИЯ: в начале ответа
 4. Если товара нет — честно скажи и предложи альтернативу
-5. СТРОГО: когда покупатель выбирает товар — сначала уточни способ доставки, затем запроси ФИО, адрес и телефон, затем отправь реквизиты
+5. СТРОГО: когда покупатель выбирает товар — сначала уточни способ доставки, затем напиши ТОЛЬКО "Подскажите пожалуйста Ваше полное ФИО для оформления заказа." — адрес и телефон система запросит сама
 6. СТРОГО ЗАПРЕЩЕНО писать ПОКУПКА: пока покупатель не написал что уже перевёл деньги (слова: перевёл, оплатил, перевео, скинул)
 7. После слова ПОКУПКА: — поблагодари, скажи что отправишь в течение 2 дней и дашь трек-номер"""
 
@@ -494,7 +494,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await clear_history(chat_id)
     order_context[chat_id] = {
         "name": "", "size": "", "price": 0, "cost": 0, "article": "",
-        "recipient_name": "", "recipient_address": "", "recipient_phone": ""
+        "recipient_name": "", "recipient_address": "", "recipient_phone": "",
+        "state": "idle"
     }
     await update.message.reply_text(
         "Здравствуйте! Добро пожаловать в LOCAL Store 😊 У нас большой выбор одежды от топовых брендов — Bape, CDG, Y3, Гоша Рубчинский и другие. Что Вас интересует?"
@@ -506,7 +507,8 @@ async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await clear_history(chat_id)
     order_context[chat_id] = {
         "name": "", "size": "", "price": 0, "cost": 0, "article": "",
-        "recipient_name": "", "recipient_address": "", "recipient_phone": ""
+        "recipient_name": "", "recipient_address": "", "recipient_phone": "",
+        "state": "idle"
     }
     await update.message.reply_text("Диалог сброшен. Начинаем заново!")
 
@@ -553,11 +555,55 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     inventory_text, inventory_items = await get_inventory()
 
+    # Инициализируем контекст если нет
+    if chat_id not in order_context:
+        order_context[chat_id] = {
+            "name": "", "size": "", "price": 0, "cost": 0, "article": "",
+            "recipient_name": "", "recipient_address": "", "recipient_phone": "",
+            "state": "idle"
+        }
+
+    state = order_context[chat_id].get("state", "idle")
+
+    # ── Машина состояний для сбора контактов ──────────────────
+    if state == "waiting_fio":
+        order_context[chat_id]["recipient_name"] = user_text.strip()
+        order_context[chat_id]["state"] = "waiting_address"
+        await update.message.reply_text("Подскажите адрес доставки (город, улица, дом, квартира).")
+        await save_message(chat_id, "user", f"{user_name}: {user_text}")
+        await save_message(chat_id, "assistant", "Подскажите адрес доставки.")
+        return
+
+    if state == "waiting_address":
+        order_context[chat_id]["recipient_address"] = user_text.strip()
+        order_context[chat_id]["state"] = "waiting_phone"
+        await update.message.reply_text("И последнее — номер телефона для связи.")
+        await save_message(chat_id, "user", f"{user_name}: {user_text}")
+        await save_message(chat_id, "assistant", "И последнее — номер телефона.")
+        return
+
+    if state == "waiting_phone":
+        order_context[chat_id]["recipient_phone"] = user_text.strip()
+        order_context[chat_id]["state"] = "idle"
+        ctx = order_context[chat_id]
+        price = ctx.get("price", 0)
+        await save_message(chat_id, "user", f"{user_name}: {user_text}")
+        reply = (
+            f"Спасибо! Вот реквизиты для оплаты:\n\n"
+            f"Перевод на Тинькофф карту: 2200700986188158\n"
+            f"Или по номеру: +79776810910\n"
+            f"Имя получателя: Артём А.\n\n"
+            f"Сумма: {price}₽\n\n"
+            f"После перевода напишите мне, и я оформлю отправку."
+        )
+        await update.message.reply_text(reply)
+        await save_message(chat_id, "assistant", reply)
+        schedule_followup(context.bot, chat_id)
+        return
+    # ──────────────────────────────────────────────────────────
+
     # Синхронно обновляем товар/размер/цену
     _update_order_context_sync(chat_id, user_text, inventory_items)
-
-    # Async парсим контакты из сообщения покупателя
-    await _update_contacts_if_needed(chat_id, user_text)
 
     # CRM
     await notify_client(update.effective_user, chat_id)
@@ -584,7 +630,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         response = await loop.run_in_executor(None, _call)
         reply = response.content[0].text
 
-        # Обновляем товар/размер из ответа бота (без парсинга контактов)
+        # Обновляем товар/размер из ответа бота
         _update_order_context_sync(chat_id, reply, inventory_items)
         await save_message(chat_id, "user", f"{user_name}: {user_text}")
         await save_message(chat_id, "assistant", reply)
@@ -622,10 +668,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         else:
             await update.message.reply_text(reply)
-            # Запускаем followup если бот отправил реквизиты
-            requisites_sent = any(w in reply for w in ["2200700986188158", "переводи", "Переводи", "карту", "на карт"])
-            if requisites_sent:
-                schedule_followup(context.bot, chat_id)
+            # Если бот запросил ФИО — переключаем состояние
+            reply_lower = reply.lower()
+            if any(w in reply_lower for w in ["фио", "полное имя", "ваше имя", "имя и фамилия", "напишите имя"]):
+                order_context[chat_id]["state"] = "waiting_fio"
+                order_context[chat_id]["recipient_name"] = ""
+                order_context[chat_id]["recipient_address"] = ""
+                order_context[chat_id]["recipient_phone"] = ""
 
     except Exception as e:
         await update.message.reply_text("Секунду, уточню информацию и отвечу!")
