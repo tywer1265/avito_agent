@@ -608,6 +608,22 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # CRM
     await notify_client(update.effective_user, chat_id)
 
+    # Алерт владельцу о новом сообщении (для ручного ответа)
+    try:
+        owner_token = os.getenv("TELEGRAM_BOT_TOKEN")
+        if owner_token:
+            async with httpx.AsyncClient(timeout=3) as http:
+                await http.post(
+                    f"https://api.telegram.org/bot{owner_token}/sendMessage",
+                    json={
+                        "chat_id": OWNER_CHAT_ID,
+                        "text": f"💬 {user_name} (id:{chat_id}):\n{user_text}\n\n↩️ Reply чтобы ответить",
+                        "parse_mode": "HTML"
+                    }
+                )
+    except Exception as e:
+        print(f"[owner_alert] error: {e}")
+
     history = await load_history(chat_id)
     history.append({"role": "user", "content": f"{user_name}: {user_text}"})
     if len(history) > 20:
@@ -642,7 +658,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(clean)
             await context.bot.send_message(
                 chat_id=OWNER_CHAT_ID,
-                text=f"🚨 ЭСКАЛАЦИЯ от {user_name}!\nСообщение: {user_text}\nОтвет: {clean}"
+                text=f"🚨 ЭСКАЛАЦИЯ от {user_name} (id:{chat_id})!\n"
+                     f"Сообщение: {user_text}\n"
+                     f"Ответ: {clean}\n\n"
+                     f"💬 Сделай Reply на это сообщение чтобы ответить покупателю"
             )
         elif is_sale:
             clean = reply.replace("ПОКУПКА:", "").strip()
@@ -654,7 +673,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await context.bot.send_message(
                 chat_id=OWNER_CHAT_ID,
                 text=f"🛍 Новый заказ!\n"
-                     f"Покупатель: {user_name}\n"
+                     f"Покупатель: {user_name} (id:{chat_id})\n"
                      f"Товар: {order['name'] or '?'}\n"
                      f"Размер: {order['size'] or '?'}\n"
                      f"Цена: {order['price'] or '?'} руб.\n"
@@ -664,7 +683,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                      f"ФИО: {ctx.get('recipient_name') or '?'}\n"
                      f"Адрес: {ctx.get('recipient_address') or '?'}\n"
                      f"Телефон: {ctx.get('recipient_phone') or '?'}\n"
-                     f"{status}"
+                     f"{status}\n\n"
+                     f"💬 Сделай Reply на это сообщение чтобы ответить покупателю"
             )
         else:
             await update.message.reply_text(reply)
@@ -681,24 +701,90 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         print(f"Error: {e}")
 
 
+async def handle_owner_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Владелец делает Reply на алерт — пересылаем покупателю."""
+    if not update.message.reply_to_message:
+        return
+
+    original_text = update.message.reply_to_message.text or ""
+    owner_reply = update.message.text
+
+    # Извлекаем chat_id покупателя из текста алерта (id:XXXXXXXXX)
+    match = re.search(r'id:(\d+)', original_text)
+    if not match:
+        await update.message.reply_text("❌ Не могу найти id покупателя в сообщении")
+        return
+
+    buyer_chat_id = int(match.group(1))
+
+    try:
+        client_token = os.getenv("CLIENT_BOT_TOKEN")
+        async with httpx.AsyncClient(timeout=5) as http:
+            await http.post(
+                f"https://api.telegram.org/bot{client_token}/sendMessage",
+                json={"chat_id": buyer_chat_id, "text": owner_reply}
+            )
+        await update.message.reply_text("✅ Отправлено покупателю")
+        print(f"[owner_reply] отправлено покупателю {buyer_chat_id}: {owner_reply}")
+    except Exception as e:
+        await update.message.reply_text(f"❌ Ошибка: {e}")
+        print(f"[owner_reply] error: {e}")
+
+
 def main():
-    async def post_init(app):
+    async def run():
         await init_db()
 
-    app = (
-        Application.builder()
-        .token(TELEGRAM_TOKEN)
-        .post_init(post_init)
-        .build()
-    )
+        # Бот покупателей
+        client_app = (
+            Application.builder()
+            .token(TELEGRAM_TOKEN)
+            .build()
+        )
+        client_app.add_handler(CommandHandler("start", start))
+        client_app.add_handler(CommandHandler("reset", reset))
+        client_app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
+        client_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("reset", reset))
-    app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+        # Бот владельца
+        owner_token = os.getenv("TELEGRAM_BOT_TOKEN")
+        owner_app = None
+        if owner_token and owner_token != TELEGRAM_TOKEN:
+            owner_app = (
+                Application.builder()
+                .token(owner_token)
+                .build()
+            )
+            owner_app.add_handler(
+                MessageHandler(filters.TEXT & filters.REPLY, handle_owner_reply)
+            )
 
-    print("Бот запущен")
-    app.run_polling(drop_pending_updates=True)
+        # Запускаем оба
+        await client_app.initialize()
+        await client_app.start()
+        await client_app.updater.start_polling(drop_pending_updates=True)
+
+        if owner_app:
+            await owner_app.initialize()
+            await owner_app.start()
+            await owner_app.updater.start_polling(drop_pending_updates=True)
+            print("Оба бота запущены")
+        else:
+            print("Бот покупателей запущен (токен владельца не найден)")
+
+        # Держим процесс живым
+        try:
+            await asyncio.Event().wait()
+        finally:
+            await client_app.updater.stop()
+            await client_app.stop()
+            await client_app.shutdown()
+            if owner_app:
+                await owner_app.updater.stop()
+                await owner_app.stop()
+                await owner_app.shutdown()
+
+    asyncio.run(run())
 
 
 if __name__ == "__main__":
