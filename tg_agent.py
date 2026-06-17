@@ -565,6 +565,9 @@ async def handle_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def handle_purchase_confirmed(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Покупатель написал что перевёл — фиксируем заказ."""
     pass  # логика уже в handle_message через PURCHASE_KEYWORDS
+
+
+async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     user_name = update.effective_user.first_name or "Покупатель"
 
