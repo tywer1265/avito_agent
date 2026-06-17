@@ -11,7 +11,7 @@ import anthropic
 TELEGRAM_TOKEN = os.getenv("CLIENT_BOT_TOKEN")
 ANTHROPIC_KEY = os.getenv("ANTHROPIC_API_KEY")
 OWNER_CHAT_ID = int(os.getenv("TELEGRAM_OWNER_CHAT_ID", "5016220108"))
-DATABASE_URL = os.getenv("DATABASE_URL", "").replace("postgresql+asyncpg://", "postgresql://")
+DATABASE_URL = os.getenv("DATABASE_URL_ASYNCPG", os.getenv("DATABASE_URL", "").replace("postgresql+asyncpg://", "postgresql://"))
 N8N_INVENTORY_URL = "https://tywer1265.app.n8n.cloud/webhook/inventory"
 N8N_ORDERS_URL = "https://tywer1265.app.n8n.cloud/webhook/orders/new"
 
