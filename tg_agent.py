@@ -657,13 +657,21 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if reply.startswith("ЭСКАЛАЦИЯ:"):
             clean = reply.replace("ЭСКАЛАЦИЯ:", "").strip()
             await update.message.reply_text(clean)
-            await context.bot.send_message(
-                chat_id=OWNER_CHAT_ID,
-                text=f"🚨 ЭСКАЛАЦИЯ от {user_name} (id:{chat_id})!\n"
-                     f"Сообщение: {user_text}\n"
-                     f"Ответ: {clean}\n\n"
-                     f"💬 Сделай Reply на это сообщение чтобы ответить покупателю"
-            )
+            try:
+                owner_token = os.getenv("TELEGRAM_BOT_TOKEN")
+                async with httpx.AsyncClient(timeout=5) as http:
+                    await http.post(
+                        f"https://api.telegram.org/bot{owner_token}/sendMessage",
+                        json={
+                            "chat_id": OWNER_CHAT_ID,
+                            "text": f"🚨 ЭСКАЛАЦИЯ от {user_name} (id:{chat_id})!\n"
+                                    f"Сообщение: {user_text}\n"
+                                    f"Ответ: {clean}\n\n"
+                                    f"💬 Reply чтобы ответить покупателю"
+                        }
+                    )
+            except Exception as e:
+                print(f"[escalation_alert] error: {e}")
         elif is_sale:
             clean = reply.replace("ПОКУПКА:", "").strip()
             await update.message.reply_text(clean)
