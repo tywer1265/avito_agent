@@ -173,7 +173,7 @@ def _parse_contacts_from_text(text: str) -> dict:
 def _update_order_context(chat_id: int, text: str, inventory: list) -> None:
     if chat_id not in order_context:
         order_context[chat_id] = {
-            "name": "", "size": "", "price": 0, "article": "",
+            "name": "", "size": "", "price": 0, "cost": 0, "article": "",
             "recipient_name": "", "recipient_address": "", "recipient_phone": ""
         }
 
@@ -200,6 +200,10 @@ def _update_order_context(chat_id: int, text: str, inventory: list) -> None:
         if isinstance(price, str):
             price = _extract_price(price)
         order_context[chat_id]["price"] = price
+        cost = best_match.get("cost", 0)
+        if isinstance(cost, str):
+            cost = int(cost) if cost.strip().isdigit() else 0
+        order_context[chat_id]["cost"] = cost
 
     # Размер
     size_match = re.search(r"\b(3XL|XXL|XL|XS|[SML])\b", text, re.IGNORECASE)
@@ -292,13 +296,17 @@ async def analyze_photo(photo_bytes: bytes, inventory_text: str) -> str:
 
 async def notify_sale(user_name: str, chat_id: int) -> dict:
     ctx = order_context.get(chat_id, {})
+    price = ctx.get("price", 0) or 0
+    cost = ctx.get("cost", 0) or 0
+    profit = price - cost if price and cost else 0
     payload = {
         "date": datetime.now().strftime("%d.%m"),
         "name": ctx.get("name", ""),
         "size": ctx.get("size", ""),
         "status": "Ожидает отправки",
-        "price": ctx.get("price", 0),
-        "cost": "",
+        "price": price,
+        "cost": cost,
+        "profit": profit,
         "article": ctx.get("article", ""),
         "buyer": user_name,
         "recipient_name": ctx.get("recipient_name", ""),
@@ -376,7 +384,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     await clear_history(chat_id)
     order_context[chat_id] = {
-        "name": "", "size": "", "price": 0, "article": "",
+        "name": "", "size": "", "price": 0, "cost": 0, "article": "",
         "recipient_name": "", "recipient_address": "", "recipient_phone": ""
     }
     await update.message.reply_text(
@@ -388,7 +396,7 @@ async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     await clear_history(chat_id)
     order_context[chat_id] = {
-        "name": "", "size": "", "price": 0, "article": "",
+        "name": "", "size": "", "price": 0, "cost": 0, "article": "",
         "recipient_name": "", "recipient_address": "", "recipient_phone": ""
     }
     await update.message.reply_text("Диалог сброшен. Начинаем заново!")
@@ -489,6 +497,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                      f"Товар: {order['name'] or '?'}\n"
                      f"Размер: {order['size'] or '?'}\n"
                      f"Цена: {order['price'] or '?'} руб.\n"
+                     f"Себестоимость: {order['cost'] or '?'} руб.\n"
+                     f"Прибыль: {order['profit'] or '?'} руб.\n"
                      f"Артикул: {order['article'] or '?'}\n"
                      f"ФИО: {ctx.get('recipient_name') or '?'}\n"
                      f"Адрес: {ctx.get('recipient_address') or '?'}\n"
