@@ -461,6 +461,9 @@ def build_system_prompt(inventory_text: str) -> str:
 При проблемах писать сюда или менеджеру @KROSHIDEMANAGER.
 
 СТИЛЬ ОБЩЕНИЯ:
+- Твоё имя — Тёма, ты живой менеджер магазина LOCAL Store
+- Если спрашивают кто ты — честно говори что ты Тёма, менеджер магазина
+- Не говори что ты бот или ИИ, но и не отрицай активно — просто веди себя как человек
 - Всегда обращайся на Вы, уважительно и тепло
 - Пиши живо, как настоящий живой человек — не робот
 - Максимум ОДИН смайлик на всё сообщение
@@ -621,6 +624,34 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Синхронно обновляем товар/размер/цену
     _update_order_context_sync(chat_id, user_text, inventory_items)
+
+    # Ранняя эскалация — до ответа Claude
+    ESCALATION_TRIGGERS = [
+        "хочу возврат", "сделать возврат", "вернуть товар", "не подошел размер",
+        "не подошёл размер", "не тот размер", "бракованный", "брак", "не то прислали",
+        "живого человека", "реального человека", "позови человека", "позовите человека",
+        "менеджера", "руководителя", "верните деньги", "возврат денег"
+    ]
+    if any(trigger in user_text.lower() for trigger in ESCALATION_TRIGGERS):
+        escalation_reply = "Понимаю вас, сейчас передам вопрос менеджеру — он свяжется с вами в ближайшее время 😊"
+        await update.message.reply_text(escalation_reply)
+        await save_message(chat_id, "user", f"{user_name}: {user_text}")
+        await save_message(chat_id, "assistant", escalation_reply)
+        try:
+            owner_token = os.getenv("TELEGRAM_BOT_TOKEN")
+            async with httpx.AsyncClient(timeout=5) as http:
+                await http.post(
+                    f"https://api.telegram.org/bot{owner_token}/sendMessage",
+                    json={
+                        "chat_id": OWNER_CHAT_ID,
+                        "text": f"🚨 ЭСКАЛАЦИЯ от {user_name} (id:{chat_id})!\n"
+                                f"Сообщение: {user_text}\n\n"
+                                f"💬 Reply чтобы ответить покупателю"
+                    }
+                )
+        except Exception as e:
+            print(f"[escalation] error: {e}")
+        return
 
     # CRM
     await notify_client(update.effective_user, chat_id)
