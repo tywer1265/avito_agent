@@ -29,6 +29,7 @@ client = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
 order_context = {}
 spam_counter = {}
 followup_tasks = {}
+paused_chats = {}  # chat_id → timestamp когда поставлен на паузу
 db_pool = None
 _inventory_cache: tuple[str, list, float] = ("", [], 0.0)
 
@@ -550,6 +551,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Чуть помедленнее, отвечу на все вопросы по очереди 😊")
         return
 
+    # Если агент на паузе — молчим
+    if chat_id in paused_chats:
+        print(f"[pause] агент на паузе для {chat_id}, сообщение игнорируется")
+        return
+
     # Покупатель написал — отменяем followup
     cancel_followup(chat_id)
 
@@ -670,22 +676,31 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             order = await notify_sale(user_name, chat_id)
             ctx = order_context.get(chat_id, {})
             status = "✅ Записано в таблицу" if order["name"] else "⚠️ Товар не определён — проверь таблицу"
-            await context.bot.send_message(
-                chat_id=OWNER_CHAT_ID,
-                text=f"🛍 Новый заказ!\n"
-                     f"Покупатель: {user_name} (id:{chat_id})\n"
-                     f"Товар: {order['name'] or '?'}\n"
-                     f"Размер: {order['size'] or '?'}\n"
-                     f"Цена: {order['price'] or '?'} руб.\n"
-                     f"Себестоимость: {order['cost'] or '?'} руб.\n"
-                     f"Прибыль: {order['profit'] or '?'} руб.\n"
-                     f"Артикул: {order['article'] or '?'}\n"
-                     f"ФИО: {ctx.get('recipient_name') or '?'}\n"
-                     f"Адрес: {ctx.get('recipient_address') or '?'}\n"
-                     f"Телефон: {ctx.get('recipient_phone') or '?'}\n"
-                     f"{status}\n\n"
-                     f"💬 Сделай Reply на это сообщение чтобы ответить покупателю"
+            alert_text = (
+                f"🛍 Новый заказ!\n"
+                f"Покупатель: {user_name} (id:{chat_id})\n"
+                f"Товар: {order['name'] or '?'}\n"
+                f"Размер: {order['size'] or '?'}\n"
+                f"Цена: {order['price'] or '?'} руб.\n"
+                f"Себестоимость: {order['cost'] or '?'} руб.\n"
+                f"Прибыль: {order['profit'] or '?'} руб.\n"
+                f"Артикул: {order['article'] or '?'}\n"
+                f"ФИО: {ctx.get('recipient_name') or '?'}\n"
+                f"Адрес: {ctx.get('recipient_address') or '?'}\n"
+                f"Телефон: {ctx.get('recipient_phone') or '?'}\n"
+                f"{status}\n\n"
+                f"💬 Reply чтобы ответить покупателю"
             )
+            # Отправляем в бот владельца через HTTP
+            try:
+                owner_token = os.getenv("TELEGRAM_BOT_TOKEN")
+                async with httpx.AsyncClient(timeout=5) as http:
+                    await http.post(
+                        f"https://api.telegram.org/bot{owner_token}/sendMessage",
+                        json={"chat_id": OWNER_CHAT_ID, "text": alert_text}
+                    )
+            except Exception as e:
+                print(f"[order_alert] error: {e}")
         else:
             await update.message.reply_text(reply)
             # Если бот запросил ФИО — переключаем состояние
@@ -702,14 +717,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def handle_owner_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Владелец делает Reply на алерт — пересылаем покупателю."""
+    """Владелец делает Reply на алерт — пересылаем покупателю и ставим агента на паузу."""
     if not update.message.reply_to_message:
         return
 
     original_text = update.message.reply_to_message.text or ""
     owner_reply = update.message.text
 
-    # Извлекаем chat_id покупателя из текста алерта (id:XXXXXXXXX)
     match = re.search(r'id:(\d+)', original_text)
     if not match:
         await update.message.reply_text("❌ Не могу найти id покупателя в сообщении")
@@ -724,11 +738,56 @@ async def handle_owner_reply(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 f"https://api.telegram.org/bot{client_token}/sendMessage",
                 json={"chat_id": buyer_chat_id, "text": owner_reply}
             )
-        await update.message.reply_text("✅ Отправлено покупателю")
-        print(f"[owner_reply] отправлено покупателю {buyer_chat_id}: {owner_reply}")
+        # Ставим агента на паузу для этого покупателя
+        paused_chats[buyer_chat_id] = datetime.now().timestamp()
+        await update.message.reply_text(
+            f"✅ Отправлено покупателю\n"
+            f"⏸ Агент отключён\n\n"
+            f"Чтобы включить обратно: /resume {buyer_chat_id}\n"
+            f"Или автоматически через 30 минут"
+        )
+        print(f"[owner_reply] отправлено {buyer_chat_id}, агент на паузе")
+
+        # Автоматическое включение через 30 минут
+        async def auto_resume():
+            await asyncio.sleep(30 * 60)
+            if paused_chats.get(buyer_chat_id):
+                del paused_chats[buyer_chat_id]
+                try:
+                    owner_token = os.getenv("TELEGRAM_BOT_TOKEN")
+                    async with httpx.AsyncClient(timeout=5) as h:
+                        await h.post(
+                            f"https://api.telegram.org/bot{owner_token}/sendMessage",
+                            json={
+                                "chat_id": OWNER_CHAT_ID,
+                                "text": f"▶️ Агент автоматически включён для покупателя id:{buyer_chat_id}"
+                            }
+                        )
+                except Exception:
+                    pass
+
+        asyncio.create_task(auto_resume())
+
     except Exception as e:
         await update.message.reply_text(f"❌ Ошибка: {e}")
         print(f"[owner_reply] error: {e}")
+
+
+async def handle_owner_commands(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Команды владельца: /resume chat_id."""
+    text = update.message.text or ""
+    if text.startswith("/resume"):
+        parts = text.split()
+        if len(parts) < 2:
+            await update.message.reply_text("Использование: /resume 123456789")
+            return
+        try:
+            buyer_chat_id = int(parts[1])
+            if buyer_chat_id in paused_chats:
+                del paused_chats[buyer_chat_id]
+            await update.message.reply_text(f"▶️ Агент включён для покупателя {buyer_chat_id}")
+        except ValueError:
+            await update.message.reply_text("❌ Неверный chat_id")
 
 
 def main():
@@ -764,6 +823,8 @@ def main():
         await client_app.updater.start_polling(drop_pending_updates=True)
 
         if owner_app:
+            owner_app.add_handler(CommandHandler("resume", handle_owner_commands))
+            owner_app.add_handler(MessageHandler(filters.TEXT & filters.REPLY, handle_owner_reply))
             await owner_app.initialize()
             await owner_app.start()
             await owner_app.updater.start_polling(drop_pending_updates=True)
