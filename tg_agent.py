@@ -1,5 +1,6 @@
 import os
 import re
+import json
 import httpx
 import base64
 import asyncio
@@ -27,7 +28,7 @@ PURCHASE_KEYWORDS = [
 client = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
 order_context = {}
 spam_counter = {}
-followup_tasks = {}  # chat_id → asyncio.Task
+followup_tasks = {}
 db_pool = None
 _inventory_cache: tuple[str, list, float] = ("", [], 0.0)
 
@@ -131,38 +132,37 @@ def _extract_price(text: str) -> int:
 
 
 def _extract_phone(text: str) -> str:
-    """Извлекает телефон строго 10-11 цифр, игнорирует номера карт (16 цифр)."""
-    # Убираем все пробелы и дефисы для анализа, но сохраняем оригинал
-    # Ищем телефон: начинается с 7, 8 или +7, строго 10-11 цифр
+    """Строго 11 цифр начиная с 7/8, игнорирует 16-значные номера карт."""
     matches = re.findall(r'(?<!\d)(?:\+7|8|7)[\s\-]?\(?\d{3}\)?[\s\-]?\d{3}[\s\-]?\d{2}[\s\-]?\d{2}(?!\d)', text)
     if matches:
-        # Берём первый матч, убираем лишние символы
-        phone = re.sub(r'[\s\-\(\)]', '', matches[0])
-        return phone
-    # Запасной вариант — строго 11 цифр начиная с 7 или 8, не часть более длинного числа
+        return re.sub(r'[\s\-\(\)]', '', matches[0])
     matches2 = re.findall(r'(?<!\d)[78]\d{10}(?!\d)', text.replace(' ', '').replace('-', ''))
     return matches2[0] if matches2 else ""
 
 
-def _parse_contacts_from_text(text: str) -> dict:
-    """Парсит ФИО, телефон и адрес из произвольного текста покупателя через Claude."""
+async def _parse_contacts_async(text: str) -> dict:
+    """Async парсинг ФИО/телефон/адрес через Claude."""
     try:
-        response = client.messages.create(
-            model="claude-haiku-4-5-20251001",
-            max_tokens=200,
-            system="""Извлеки из текста данные получателя посылки. Верни ТОЛЬКО JSON без пояснений:
+        loop = asyncio.get_event_loop()
+        def _call():
+            return client.messages.create(
+                model="claude-haiku-4-5-20251001",
+                max_tokens=200,
+                system="""Извлеки из текста данные получателя посылки. Верни ТОЛЬКО JSON без пояснений и без markdown:
 {"fio": "...", "phone": "...", "address": "..."}
 
 Правила:
-- fio: полное имя (может быть любой регистр, транслит, иностранное имя)
-- phone: номер телефона 11 цифр (начинается на 7 или 8). Игнорируй номера карт (16 цифр). Если нет — пустая строка
-- address: адрес доставки (город, улица, дом и т.д.). Если нет — пустая строка
-- Если данные не найдены — пустая строка для этого поля
+- fio: полное имя (любой регистр, транслит, иностранное имя). Если 2+ слова похожи на имя — это fio
+- phone: ровно 11 цифр начинается на 7 или 8. ИГНОРИРУЙ номера карт (16 цифр типа 2200700986188158). Если нет телефона — пустая строка
+- address: улица, дом, город. Если нет — пустая строка
 - ТОЛЬКО JSON, никакого текста вокруг""",
-            messages=[{"role": "user", "content": text}]
-        )
-        import json
-        result = json.loads(response.content[0].text.strip())
+                messages=[{"role": "user", "content": text}]
+            )
+        response = await loop.run_in_executor(None, _call)
+        raw = response.content[0].text.strip()
+        # Убираем markdown если есть
+        raw = re.sub(r'```json|```', '', raw).strip()
+        result = json.loads(raw)
         return {
             "fio": result.get("fio", ""),
             "phone": result.get("phone", ""),
@@ -173,7 +173,8 @@ def _parse_contacts_from_text(text: str) -> dict:
         return {"fio": "", "phone": _extract_phone(text), "address": ""}
 
 
-def _update_order_context(chat_id: int, text: str, inventory: list, parse_contacts: bool = True) -> None:
+def _update_order_context_sync(chat_id: int, text: str, inventory: list) -> None:
+    """Синхронная часть — товар, размер, цена. БЕЗ парсинга контактов."""
     if chat_id not in order_context:
         order_context[chat_id] = {
             "name": "", "size": "", "price": 0, "cost": 0, "article": "",
@@ -182,12 +183,32 @@ def _update_order_context(chat_id: int, text: str, inventory: list, parse_contac
 
     text_lower = text.lower()
 
-    # Матч товара — ищем точное совпадение названия
+    # Определяем тип одежды из текста
+    ITEM_TYPES = {
+        "футболк": ["футболк"],
+        "худи": ["худи"],
+        "свитшот": ["свитшот"],
+        "лонгслив": ["лонгслив"],
+        "поло": ["поло"],
+        "шоппер": ["шоппер"],
+    }
+    detected_type = None
+    for type_key, keywords in ITEM_TYPES.items():
+        if any(kw in text_lower for kw in keywords):
+            detected_type = type_key
+            break
+
+    # Матч товара с учётом типа одежды
     best_match = None
     best_score = 0
     for item in inventory:
         item_name = str(item.get("name", ""))
         item_lower = item_name.lower()
+
+        # Если тип определён — пропускаем товары другого типа
+        if detected_type and detected_type not in item_lower:
+            continue
+
         words = [w for w in item_lower.split() if len(w) > 2]
         if not words:
             continue
@@ -195,6 +216,19 @@ def _update_order_context(chat_id: int, text: str, inventory: list, parse_contac
         if score > best_score and score >= max(1, len(words) // 2):
             best_score = score
             best_match = item
+
+    # Если с фильтром по типу ничего не нашли — ищем без фильтра
+    if not best_match and detected_type:
+        for item in inventory:
+            item_name = str(item.get("name", ""))
+            item_lower = item_name.lower()
+            words = [w for w in item_lower.split() if len(w) > 2]
+            if not words:
+                continue
+            score = sum(1 for w in words if w in text_lower)
+            if score > best_score and score >= max(1, len(words) // 2):
+                best_score = score
+                best_match = item
 
     if best_match:
         order_context[chat_id]["name"] = str(best_match.get("name", ""))
@@ -205,7 +239,7 @@ def _update_order_context(chat_id: int, text: str, inventory: list, parse_contac
         order_context[chat_id]["price"] = price
         cost = best_match.get("cost", 0)
         if isinstance(cost, str):
-            cost = int(cost) if cost.strip().isdigit() else 0
+            cost = int(cost) if str(cost).strip().isdigit() else 0
         order_context[chat_id]["cost"] = cost
 
     # Размер
@@ -213,30 +247,46 @@ def _update_order_context(chat_id: int, text: str, inventory: list, parse_contac
     if size_match:
         order_context[chat_id]["size"] = size_match.group(1).upper()
 
-    # Цена
+    # Цена из текста
     price = _extract_price(text)
-    if price > 0:
+    if price > 0 and price < 50000:
         order_context[chat_id]["price"] = price
 
-    # Контакты — парсим через Claude если текст похож на данные получателя
-    # Признаки: есть цифры (телефон) или 2+ слова подряд (ФИО) или адресные слова
+
+async def _update_contacts_if_needed(chat_id: int, text: str) -> None:
+    """Async парсинг контактов — только если поля ещё пустые."""
+    ctx = order_context.get(chat_id, {})
+    already_has_all = (
+        ctx.get("recipient_name") and
+        ctx.get("recipient_phone") and
+        ctx.get("recipient_address")
+    )
+    if already_has_all:
+        return
+
+    # Проверяем что текст похож на данные получателя
     has_digits = bool(re.search(r'\d{7,}', text))
-    has_address_hint = any(w in text_lower for w in [
+    has_address_hint = any(w in text.lower() for w in [
         "улица", "ул.", "проспект", "пр.", "город", "москва", "санкт", "питер",
         "площадь", "д.", "кв.", "спб", "нск", "екб", "красная", "ленина",
-        "пушкина", "мира", "победы", "советская"
+        "пушкина", "мира", "победы", "советская", "кржижановского", "путина",
+        "садовая", "лесная", "центральная", "школьная", "молодёжная"
     ])
     word_count = len(text.split())
 
-    if parse_contacts and (has_digits or has_address_hint or word_count >= 3):
-        contacts = _parse_contacts_from_text(text)
-        # Заполняем только пустые поля — не перезатираем уже полученные данные
-        if contacts["fio"] and not order_context[chat_id].get("recipient_name"):
-            order_context[chat_id]["recipient_name"] = contacts["fio"]
-        if contacts["phone"] and not order_context[chat_id].get("recipient_phone"):
-            order_context[chat_id]["recipient_phone"] = contacts["phone"]
-        if contacts["address"] and not order_context[chat_id].get("recipient_address"):
-            order_context[chat_id]["recipient_address"] = contacts["address"]
+    if not (has_digits or has_address_hint or word_count >= 3):
+        return
+
+    contacts = await _parse_contacts_async(text)
+    print(f"[contacts] parsed: {contacts}")
+
+    # Заполняем только пустые поля
+    if contacts["fio"] and not ctx.get("recipient_name"):
+        order_context[chat_id]["recipient_name"] = contacts["fio"]
+    if contacts["phone"] and not ctx.get("recipient_phone"):
+        order_context[chat_id]["recipient_phone"] = contacts["phone"]
+    if contacts["address"] and not ctx.get("recipient_address"):
+        order_context[chat_id]["recipient_address"] = contacts["address"]
 
 
 async def get_inventory() -> tuple[str, list]:
@@ -265,10 +315,12 @@ async def get_inventory() -> tuple[str, list]:
 async def analyze_photo(photo_bytes: bytes, inventory_text: str) -> str:
     image_data = base64.standard_b64encode(photo_bytes).decode("utf-8")
     try:
-        response = client.messages.create(
-            model="claude-haiku-4-5-20251001",
-            max_tokens=400,
-            system=f"""Ты — менеджер магазина одежды LOCAL Store.
+        loop = asyncio.get_event_loop()
+        def _call():
+            return client.messages.create(
+                model="claude-haiku-4-5-20251001",
+                max_tokens=400,
+                system=f"""Ты — менеджер магазина одежды LOCAL Store.
 Покупатель прислал фото одежды которую хочет купить.
 
 НАШИ ТОВАРЫ В НАЛИЧИИ:
@@ -281,28 +333,29 @@ async def analyze_photo(photo_bytes: bytes, inventory_text: str) -> str:
 4. Если похожего нет — честно скажи и предложи альтернативу
 
 Отвечай на русском, 2-3 предложения. Без звёздочек и форматирования. Один смайлик максимум.""",
-            messages=[{
-                "role": "user",
-                "content": [
-                    {
-                        "type": "image",
-                        "source": {"type": "base64", "media_type": "image/jpeg", "data": image_data}
-                    },
-                    {"type": "text", "text": "Что это за одежда и есть ли у вас похожее?"}
-                ]
-            }]
-        )
+                messages=[{
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image",
+                            "source": {"type": "base64", "media_type": "image/jpeg", "data": image_data}
+                        },
+                        {"type": "text", "text": "Что это за одежда и есть ли у вас похожее?"}
+                    ]
+                }]
+            )
+        response = await loop.run_in_executor(None, _call)
         return response.content[0].text
     except Exception as e:
         print(f"[vision] error: {e}")
         return "Не смог распознать фото. Опишите словами что ищете — помогу найти!"
 
 
+# ── Followup ────────────────────────────────────────────────────
+
 async def send_followup(bot, chat_id: int) -> None:
-    """Отправляет followup через 2 часа если покупатель не ответил."""
     try:
-        await asyncio.sleep(2 * 60 * 60)  # 2 часа
-        # Проверяем что задача не была отменена
+        await asyncio.sleep(2 * 60 * 60)
         if chat_id in followup_tasks:
             await bot.send_message(
                 chat_id=chat_id,
@@ -316,7 +369,6 @@ async def send_followup(bot, chat_id: int) -> None:
 
 
 def schedule_followup(bot, chat_id: int) -> None:
-    """Запускает таймер followup, отменяет предыдущий если был."""
     cancel_followup(chat_id)
     task = asyncio.create_task(send_followup(bot, chat_id))
     followup_tasks[chat_id] = task
@@ -324,15 +376,15 @@ def schedule_followup(bot, chat_id: int) -> None:
 
 
 def cancel_followup(chat_id: int) -> None:
-    """Отменяет таймер followup если покупатель ответил."""
     if chat_id in followup_tasks:
         followup_tasks[chat_id].cancel()
         del followup_tasks[chat_id]
         print(f"[followup] отменён для {chat_id}")
 
 
+# ── CRM / Уведомления ──────────────────────────────────────────
+
 async def notify_client(user: object, chat_id: int) -> None:
-    """Отправляет данные клиента в n8n CRM при каждом новом сообщении."""
     ctx = order_context.get(chat_id, {})
     payload = {
         "chat_id": chat_id,
@@ -459,14 +511,6 @@ async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Диалог сброшен. Начинаем заново!")
 
 
-async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_chat.id != OWNER_CHAT_ID:
-        return
-    await update.message.reply_text(
-        f"Статистика:\nАктивных контекстов: {len(order_context)}\nПамять: {'PostgreSQL' if db_pool else 'отключена'}"
-    )
-
-
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     user_name = update.effective_user.first_name or "Покупатель"
@@ -475,19 +519,17 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Чуть помедленнее, отвечу на все вопросы по очереди 😊")
         return
 
-    await context.bot.send_chat_action(chat_id=chat_id, action="typing")
+    cancel_followup(chat_id)
 
     try:
         photo = update.message.photo[-1]
         file = await context.bot.get_file(photo.file_id)
-        async with httpx.AsyncClient(timeout=15) as http:
-            resp = await http.get(file.file_path)
-            photo_bytes = resp.content
+        photo_bytes = await file.download_as_bytearray()
 
         inventory_text, inventory_items = await get_inventory()
-        reply = await analyze_photo(photo_bytes, inventory_text)
+        reply = await analyze_photo(bytes(photo_bytes), inventory_text)
 
-        _update_order_context(chat_id, reply, inventory_items)
+        _update_order_context_sync(chat_id, reply, inventory_items)
         await save_message(chat_id, "user", f"{user_name}: [прислал фото]")
         await save_message(chat_id, "assistant", reply)
         await update.message.reply_text(reply)
@@ -506,13 +548,18 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Чуть помедленнее, отвечу на все вопросы по очереди 😊")
         return
 
-    # Покупатель написал — отменяем followup если был запущен
+    # Покупатель написал — отменяем followup
     cancel_followup(chat_id)
 
     inventory_text, inventory_items = await get_inventory()
-    _update_order_context(chat_id, user_text, inventory_items)
 
-    # Отправляем данные клиента в CRM (fire and forget)
+    # Синхронно обновляем товар/размер/цену
+    _update_order_context_sync(chat_id, user_text, inventory_items)
+
+    # Async парсим контакты из сообщения покупателя
+    await _update_contacts_if_needed(chat_id, user_text)
+
+    # CRM
     await notify_client(update.effective_user, chat_id)
 
     history = await load_history(chat_id)
@@ -526,15 +573,19 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         is_negotiation = any(w in user_text.lower() for w in ["скидк", "дешевле", "уступ", "торг", "снизь"])
         model = "claude-sonnet-4-6" if is_negotiation else "claude-haiku-4-5-20251001"
 
-        response = client.messages.create(
-            model=model,
-            max_tokens=300,
-            system=build_system_prompt(inventory_text),
-            messages=history
-        )
+        loop = asyncio.get_event_loop()
+        def _call():
+            return client.messages.create(
+                model=model,
+                max_tokens=300,
+                system=build_system_prompt(inventory_text),
+                messages=history
+            )
+        response = await loop.run_in_executor(None, _call)
         reply = response.content[0].text
 
-        _update_order_context(chat_id, reply, inventory_items, parse_contacts=False)
+        # Обновляем товар/размер из ответа бота (без парсинга контактов)
+        _update_order_context_sync(chat_id, reply, inventory_items)
         await save_message(chat_id, "user", f"{user_name}: {user_text}")
         await save_message(chat_id, "assistant", reply)
 
@@ -550,7 +601,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         elif is_sale:
             clean = reply.replace("ПОКУПКА:", "").strip()
             await update.message.reply_text(clean)
-            cancel_followup(chat_id)  # Оплатил — followup не нужен
+            cancel_followup(chat_id)
             order = await notify_sale(user_name, chat_id)
             ctx = order_context.get(chat_id, {})
             status = "✅ Записано в таблицу" if order["name"] else "⚠️ Товар не определён — проверь таблицу"
@@ -571,7 +622,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         else:
             await update.message.reply_text(reply)
-            # Запускаем followup если бот отправил реквизиты для оплаты
+            # Запускаем followup если бот отправил реквизиты
             requisites_sent = any(w in reply for w in ["2200700986188158", "переводи", "Переводи", "карту", "на карт"])
             if requisites_sent:
                 schedule_followup(context.bot, chat_id)
@@ -585,14 +636,19 @@ def main():
     async def post_init(app):
         await init_db()
 
-    print("Запуск Telegram агента...")
-    app = Application.builder().token(TELEGRAM_TOKEN).post_init(post_init).build()
+    app = (
+        Application.builder()
+        .token(TELEGRAM_TOKEN)
+        .post_init(post_init)
+        .build()
+    )
+
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("reset", reset))
-    app.add_handler(CommandHandler("stats", stats))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    print("Агент запущен!")
+
+    print("Бот запущен")
     app.run_polling(drop_pending_updates=True)
 
 
