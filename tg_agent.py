@@ -127,6 +127,49 @@ def _extract_price(text: str) -> int:
     return 0
 
 
+def _extract_phone(text: str) -> str:
+    """Извлекает телефон строго 10-11 цифр, игнорирует номера карт (16 цифр)."""
+    # Убираем все пробелы и дефисы для анализа, но сохраняем оригинал
+    # Ищем телефон: начинается с 7, 8 или +7, строго 10-11 цифр
+    matches = re.findall(r'(?<!\d)(?:\+7|8|7)[\s\-]?\(?\d{3}\)?[\s\-]?\d{3}[\s\-]?\d{2}[\s\-]?\d{2}(?!\d)', text)
+    if matches:
+        # Берём первый матч, убираем лишние символы
+        phone = re.sub(r'[\s\-\(\)]', '', matches[0])
+        return phone
+    # Запасной вариант — строго 11 цифр начиная с 7 или 8, не часть более длинного числа
+    matches2 = re.findall(r'(?<!\d)[78]\d{10}(?!\d)', text.replace(' ', '').replace('-', ''))
+    return matches2[0] if matches2 else ""
+
+
+def _parse_contacts_from_text(text: str) -> dict:
+    """Парсит ФИО, телефон и адрес из произвольного текста покупателя через Claude."""
+    try:
+        response = client.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=200,
+            system="""Извлеки из текста данные получателя посылки. Верни ТОЛЬКО JSON без пояснений:
+{"fio": "...", "phone": "...", "address": "..."}
+
+Правила:
+- fio: полное имя (может быть любой регистр, транслит, иностранное имя)
+- phone: номер телефона 11 цифр (начинается на 7 или 8). Игнорируй номера карт (16 цифр). Если нет — пустая строка
+- address: адрес доставки (город, улица, дом и т.д.). Если нет — пустая строка
+- Если данные не найдены — пустая строка для этого поля
+- ТОЛЬКО JSON, никакого текста вокруг""",
+            messages=[{"role": "user", "content": text}]
+        )
+        import json
+        result = json.loads(response.content[0].text.strip())
+        return {
+            "fio": result.get("fio", ""),
+            "phone": result.get("phone", ""),
+            "address": result.get("address", "")
+        }
+    except Exception as e:
+        print(f"[contacts_parse] error: {e}")
+        return {"fio": "", "phone": _extract_phone(text), "address": ""}
+
+
 def _update_order_context(chat_id: int, text: str, inventory: list) -> None:
     if chat_id not in order_context:
         order_context[chat_id] = {
@@ -142,7 +185,6 @@ def _update_order_context(chat_id: int, text: str, inventory: list) -> None:
     for item in inventory:
         item_name = str(item.get("name", ""))
         item_lower = item_name.lower()
-        # Считаем сколько слов из названия товара есть в тексте
         words = [w for w in item_lower.split() if len(w) > 2]
         if not words:
             continue
@@ -169,19 +211,24 @@ def _update_order_context(chat_id: int, text: str, inventory: list) -> None:
     if price > 0:
         order_context[chat_id]["price"] = price
 
-    # Телефон
-    phone_match = re.search(r"[+7|8][\d\s\-]{9,11}", text)
-    if phone_match:
-        order_context[chat_id]["recipient_phone"] = phone_match.group(0).strip()
+    # Контакты — парсим через Claude если текст похож на данные получателя
+    # Признаки: есть цифры (телефон) или 2+ слова подряд (ФИО) или адресные слова
+    has_digits = bool(re.search(r'\d{7,}', text))
+    has_address_hint = any(w in text_lower for w in [
+        "улица", "ул.", "проспект", "пр.", "город", "москва", "санкт", "питер",
+        "площадь", "д.", "кв.", "спб", "нск", "екб", "красная", "ленина",
+        "пушкина", "мира", "победы", "советская"
+    ])
+    word_count = len(text.split())
 
-    # ФИО — если строка из 3+ слов с заглавных букв и нет цифр
-    fio_match = re.search(r"[А-ЯЁ][а-яё]+\s+[А-ЯЁ][а-яё]+\s+[А-ЯЁ][а-яё]+", text)
-    if fio_match:
-        order_context[chat_id]["recipient_name"] = fio_match.group(0)
-
-    # Адрес — если есть слова типа ул, пр, д, кв, город
-    if any(w in text_lower for w in ["улица", "ул.", "проспект", "пр.", "город", "москва", "площадь", "д.", "кв."]):
-        order_context[chat_id]["recipient_address"] = text.strip()
+    if has_digits or has_address_hint or word_count >= 3:
+        contacts = _parse_contacts_from_text(text)
+        if contacts["fio"]:
+            order_context[chat_id]["recipient_name"] = contacts["fio"]
+        if contacts["phone"]:
+            order_context[chat_id]["recipient_phone"] = contacts["phone"]
+        if contacts["address"]:
+            order_context[chat_id]["recipient_address"] = contacts["address"]
 
 
 async def get_inventory() -> tuple[str, list]:
