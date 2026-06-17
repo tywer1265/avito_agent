@@ -551,9 +551,20 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Чуть помедленнее, отвечу на все вопросы по очереди 😊")
         return
 
-    # Если агент на паузе — молчим
+    # Если агент на паузе — пересылаем сообщение владельцу и молчим
     if chat_id in paused_chats:
-        print(f"[pause] агент на паузе для {chat_id}, сообщение игнорируется")
+        try:
+            owner_token = os.getenv("TELEGRAM_BOT_TOKEN")
+            async with httpx.AsyncClient(timeout=3) as http:
+                await http.post(
+                    f"https://api.telegram.org/bot{owner_token}/sendMessage",
+                    json={
+                        "chat_id": OWNER_CHAT_ID,
+                        "text": f"💬 {user_name} (id:{chat_id}):\n{user_text}\n\n↩️ Reply чтобы ответить | /resume {chat_id} чтобы включить агента"
+                    }
+                )
+        except Exception as e:
+            print(f"[paused_forward] error: {e}")
         return
 
     # Покупатель написал — отменяем followup
@@ -613,22 +624,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # CRM
     await notify_client(update.effective_user, chat_id)
-
-    # Алерт владельцу о новом сообщении (для ручного ответа)
-    try:
-        owner_token = os.getenv("TELEGRAM_BOT_TOKEN")
-        if owner_token:
-            async with httpx.AsyncClient(timeout=3) as http:
-                await http.post(
-                    f"https://api.telegram.org/bot{owner_token}/sendMessage",
-                    json={
-                        "chat_id": OWNER_CHAT_ID,
-                        "text": f"💬 {user_name} (id:{chat_id}):\n{user_text}\n\n↩️ Reply чтобы ответить",
-                        "parse_mode": "HTML"
-                    }
-                )
-    except Exception as e:
-        print(f"[owner_alert] error: {e}")
 
     history = await load_history(chat_id)
     history.append({"role": "user", "content": f"{user_name}: {user_text}"})
