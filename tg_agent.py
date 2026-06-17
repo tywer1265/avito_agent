@@ -14,6 +14,7 @@ OWNER_CHAT_ID = int(os.getenv("TELEGRAM_OWNER_CHAT_ID", "5016220108"))
 DATABASE_URL = os.getenv("DATABASE_URL_ASYNCPG", os.getenv("DATABASE_URL", "").replace("postgresql+asyncpg://", "postgresql://"))
 N8N_INVENTORY_URL = "https://tywer1265.app.n8n.cloud/webhook/inventory"
 N8N_ORDERS_URL = "https://tywer1265.app.n8n.cloud/webhook/orders/new"
+N8N_CLIENTS_URL = "https://tywer1265.app.n8n.cloud/webhook/clients"
 
 MAX_MESSAGES_PER_MINUTE = 10
 
@@ -294,6 +295,26 @@ async def analyze_photo(photo_bytes: bytes, inventory_text: str) -> str:
         return "Не смог распознать фото. Опишите словами что ищете — помогу найти!"
 
 
+async def notify_client(user: object, chat_id: int) -> None:
+    """Отправляет данные клиента в n8n CRM при каждом новом сообщении."""
+    ctx = order_context.get(chat_id, {})
+    payload = {
+        "chat_id": chat_id,
+        "username": f"@{user.username}" if user.username else "",
+        "first_name": user.first_name or "",
+        "last_name": user.last_name or "",
+        "fio": ctx.get("recipient_name", ""),
+        "phone": ctx.get("recipient_phone", ""),
+        "address": ctx.get("recipient_address", ""),
+        "city": "",
+    }
+    try:
+        async with httpx.AsyncClient(timeout=5) as http:
+            await http.post(N8N_CLIENTS_URL, json=payload)
+    except Exception as e:
+        print(f"[crm] notify_client error: {e}")
+
+
 async def notify_sale(user_name: str, chat_id: int) -> dict:
     ctx = order_context.get(chat_id, {})
     price = ctx.get("price", 0) or 0
@@ -451,6 +472,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     inventory_text, inventory_items = await get_inventory()
     _update_order_context(chat_id, user_text, inventory_items)
+
+    # Отправляем данные клиента в CRM (fire and forget)
+    await notify_client(update.effective_user, chat_id)
 
     history = await load_history(chat_id)
     history.append({"role": "user", "content": f"{user_name}: {user_text}"})
