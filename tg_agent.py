@@ -173,7 +173,7 @@ def _parse_contacts_from_text(text: str) -> dict:
         return {"fio": "", "phone": _extract_phone(text), "address": ""}
 
 
-def _update_order_context(chat_id: int, text: str, inventory: list) -> None:
+def _update_order_context(chat_id: int, text: str, inventory: list, parse_contacts: bool = True) -> None:
     if chat_id not in order_context:
         order_context[chat_id] = {
             "name": "", "size": "", "price": 0, "cost": 0, "article": "",
@@ -228,13 +228,14 @@ def _update_order_context(chat_id: int, text: str, inventory: list) -> None:
     ])
     word_count = len(text.split())
 
-    if has_digits or has_address_hint or word_count >= 3:
+    if parse_contacts and (has_digits or has_address_hint or word_count >= 3):
         contacts = _parse_contacts_from_text(text)
-        if contacts["fio"]:
+        # Заполняем только пустые поля — не перезатираем уже полученные данные
+        if contacts["fio"] and not order_context[chat_id].get("recipient_name"):
             order_context[chat_id]["recipient_name"] = contacts["fio"]
-        if contacts["phone"]:
+        if contacts["phone"] and not order_context[chat_id].get("recipient_phone"):
             order_context[chat_id]["recipient_phone"] = contacts["phone"]
-        if contacts["address"]:
+        if contacts["address"] and not order_context[chat_id].get("recipient_address"):
             order_context[chat_id]["recipient_address"] = contacts["address"]
 
 
@@ -533,7 +534,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         reply = response.content[0].text
 
-        _update_order_context(chat_id, reply, inventory_items)
+        _update_order_context(chat_id, reply, inventory_items, parse_contacts=False)
         await save_message(chat_id, "user", f"{user_name}: {user_text}")
         await save_message(chat_id, "assistant", reply)
 
