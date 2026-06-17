@@ -15,20 +15,17 @@ DATABASE_URL = os.getenv("DATABASE_URL_ASYNCPG", os.getenv("DATABASE_URL", "").r
 N8N_INVENTORY_URL = "https://tywer1265.app.n8n.cloud/webhook/inventory"
 N8N_ORDERS_URL = "https://tywer1265.app.n8n.cloud/webhook/orders/new"
 
-# Антиспам: максимум сообщений в минуту
 MAX_MESSAGES_PER_MINUTE = 10
 
 PURCHASE_KEYWORDS = [
     "оплатил", "оплачено", "перевел", "перевёл", "отправил деньги",
-    "оплату сделал", "скинул деньги",
+    "оплату сделал", "скинул деньги", "перевео",
 ]
 
 client = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
 order_context = {}
-spam_counter = {}  # chat_id -> [timestamps]
+spam_counter = {}
 db_pool = None
-
-# Кеш склада — обновляем раз в 5 минут
 _inventory_cache: tuple[str, list, float] = ("", [], 0.0)
 
 
@@ -41,7 +38,6 @@ async def init_db():
         return
     try:
         db_pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=5)
-        # Создаём таблицу истории TG диалогов если нет
         async with db_pool.acquire() as conn:
             await conn.execute("""
                 CREATE TABLE IF NOT EXISTS tg_conversations (
@@ -53,7 +49,7 @@ async def init_db():
                 )
             """)
             await conn.execute("""
-                CREATE INDEX IF NOT EXISTS idx_tg_conv_chat_id 
+                CREATE INDEX IF NOT EXISTS idx_tg_conv_chat_id
                 ON tg_conversations(chat_id, created_at DESC)
             """)
         print("[db] Подключено, таблица tg_conversations готова")
@@ -62,7 +58,7 @@ async def init_db():
         db_pool = None
 
 
-async def load_history(chat_id: int, limit: int = 20) -> list:
+async def load_history(chat_id: int, limit: int = 30) -> list:
     if not db_pool:
         return []
     try:
@@ -113,7 +109,6 @@ def is_spam(chat_id: int) -> bool:
     now = datetime.now().timestamp()
     if chat_id not in spam_counter:
         spam_counter[chat_id] = []
-    # Оставляем только последнюю минуту
     spam_counter[chat_id] = [t for t in spam_counter[chat_id] if now - t < 60]
     spam_counter[chat_id].append(now)
     return len(spam_counter[chat_id]) > MAX_MESSAGES_PER_MINUTE
@@ -134,29 +129,59 @@ def _extract_price(text: str) -> int:
 
 def _update_order_context(chat_id: int, text: str, inventory: list) -> None:
     if chat_id not in order_context:
-        order_context[chat_id] = {"name": "", "size": "", "price": 0, "article": ""}
+        order_context[chat_id] = {
+            "name": "", "size": "", "price": 0, "article": "",
+            "recipient_name": "", "recipient_address": "", "recipient_phone": ""
+        }
 
     text_lower = text.lower()
+
+    # Матч товара — ищем точное совпадение названия
+    best_match = None
+    best_score = 0
     for item in inventory:
         item_name = str(item.get("name", ""))
-        if item_name.lower() in text_lower or any(
-            word in text_lower for word in item_name.lower().split() if len(word) > 3
-        ):
-            order_context[chat_id]["name"] = item_name
-            order_context[chat_id]["article"] = item.get("article", "")
-            price = item.get("price", 0)
-            if isinstance(price, str):
-                price = _extract_price(price)
-            order_context[chat_id]["price"] = price
-            break
+        item_lower = item_name.lower()
+        # Считаем сколько слов из названия товара есть в тексте
+        words = [w for w in item_lower.split() if len(w) > 2]
+        if not words:
+            continue
+        score = sum(1 for w in words if w in text_lower)
+        if score > best_score and score >= max(1, len(words) // 2):
+            best_score = score
+            best_match = item
 
+    if best_match:
+        order_context[chat_id]["name"] = str(best_match.get("name", ""))
+        order_context[chat_id]["article"] = str(best_match.get("article", ""))
+        price = best_match.get("price", 0)
+        if isinstance(price, str):
+            price = _extract_price(price)
+        order_context[chat_id]["price"] = price
+
+    # Размер
     size_match = re.search(r"\b(3XL|XXL|XL|XS|[SML])\b", text, re.IGNORECASE)
     if size_match:
         order_context[chat_id]["size"] = size_match.group(1).upper()
 
+    # Цена
     price = _extract_price(text)
     if price > 0:
         order_context[chat_id]["price"] = price
+
+    # Телефон
+    phone_match = re.search(r"[+7|8][\d\s\-]{9,11}", text)
+    if phone_match:
+        order_context[chat_id]["recipient_phone"] = phone_match.group(0).strip()
+
+    # ФИО — если строка из 3+ слов с заглавных букв и нет цифр
+    fio_match = re.search(r"[А-ЯЁ][а-яё]+\s+[А-ЯЁ][а-яё]+\s+[А-ЯЁ][а-яё]+", text)
+    if fio_match:
+        order_context[chat_id]["recipient_name"] = fio_match.group(0)
+
+    # Адрес — если есть слова типа ул, пр, д, кв, город
+    if any(w in text_lower for w in ["улица", "ул.", "проспект", "пр.", "город", "москва", "площадь", "д.", "кв."]):
+        order_context[chat_id]["recipient_address"] = text.strip()
 
 
 async def get_inventory() -> tuple[str, list]:
@@ -181,22 +206,6 @@ async def get_inventory() -> tuple[str, list]:
     except Exception:
         return text if text else "Склад временно недоступен", items
 
-async def get_inventory_old() -> tuple[str, list]:
-    try:
-        async with httpx.AsyncClient(timeout=5) as http:
-            resp = await http.get(N8N_INVENTORY_URL)
-            data = resp.json()
-            items = data.get("inventory", [])
-            if not items:
-                return "Склад временно недоступен", []
-            lines = [
-                f"- {i['name']} ({i['size']}): {i['price']}₽, остаток: {i['stock']} шт"
-                for i in items
-            ]
-            return "\n".join(lines), items
-    except Exception:
-        return "Склад временно недоступен", []
-
 
 async def analyze_photo(photo_bytes: bytes, inventory_text: str) -> str:
     image_data = base64.standard_b64encode(photo_bytes).decode("utf-8")
@@ -216,7 +225,7 @@ async def analyze_photo(photo_bytes: bytes, inventory_text: str) -> str:
 3. Предложи его покупателю коротко и по делу
 4. Если похожего нет — честно скажи и предложи альтернативу
 
-Отвечай на русском, 2-3 предложения. Без звёздочек и форматирования.""",
+Отвечай на русском, 2-3 предложения. Без звёздочек и форматирования. Один смайлик максимум.""",
             messages=[{
                 "role": "user",
                 "content": [
@@ -245,6 +254,9 @@ async def notify_sale(user_name: str, chat_id: int) -> dict:
         "cost": "",
         "article": ctx.get("article", ""),
         "buyer": user_name,
+        "recipient_name": ctx.get("recipient_name", ""),
+        "recipient_address": ctx.get("recipient_address", ""),
+        "recipient_phone": ctx.get("recipient_phone", ""),
     }
     try:
         async with httpx.AsyncClient(timeout=10) as http:
@@ -255,13 +267,13 @@ async def notify_sale(user_name: str, chat_id: int) -> dict:
 
 
 def build_system_prompt(inventory_text: str) -> str:
-    return f"""Ты — менеджер магазина одежды LOCAL Store. Твоя цель — чтобы каждый покупатель был счастлив на 1000% и вернулся снова.
+    return f"""Ты — менеджер магазина одежды LOCAL Store. Твоя цель — чтобы каждый покупатель был счастлив и вернулся снова.
 
 ТОВАРЫ В НАЛИЧИИ:
 {inventory_text}
 
 О ТОВАРАХ:
-Все товары — реплики премиум качества.
+Все товары — премиум качества. Есть с брендовыми принтами и базовые без принта — все одинаково высокого качества.
 Футболки: 100% хлопок, ткань пенье-компакт, оверсайз крой, принт DTF (держится вечно), плотная.
 Худи и свитшоты: 80% хлопок 20% полиэстер, ткань футер, плотные, принт везде одинакового качества.
 Лонгсливы: качество как у футболок.
@@ -290,7 +302,7 @@ def build_system_prompt(inventory_text: str) -> str:
 - Никакого форматирования — никаких звёздочек, решёток, тире в начале строк
 - Отвечай коротко — 2-4 предложения максимум
 - Никогда не здоровайся повторно если уже поздоровался в этом диалоге
-- Вместо "расскажите" используй "подскажите"
+- Используй "подскажите" вместо "расскажите"
 - Не называй цену первым — сначала узнай что нужно покупателю
 - Покупатель может хотеть несколько товаров — учитывай это
 - Никогда не занижай товар — все вещи премиум качества
@@ -298,15 +310,17 @@ def build_system_prompt(inventory_text: str) -> str:
 ПРАВИЛА ПО РАЗМЕРАМ:
 - Рекомендуй ОДИН конкретный размер который лучше всего подходит
 - Не предлагай два размера сразу
-- До 175 см — S или M, 175-185 — L, выше 185 — XL
+- До 175 см — M, 175-185 см — L, выше 185 см — XL
 - Вес выше 90 кг — добавляй один размер вверх
+
+ПРАВИЛА:
 1. При торге можешь снизить цену максимум на 10%
 2. Если покупатель грубит — вежливо но твёрдо отвечай
 3. При эскалации (возврат, конфликт) — напиши ЭСКАЛАЦИЯ: в начале ответа
 4. Если товара нет — честно скажи и предложи альтернативу
-5. СТРОГО ЗАПРЕЩЕНО писать ПОКУПКА: пока покупатель не написал что уже перевёл деньги (слова: перевёл, оплатил, перевео, скинул). До этого момента просто уточняй доставку и данные получателя.
-6. Когда покупатель выбирает товар — запроси ФИО, адрес доставки и номер телефона ДО отправки реквизитов.
-7. После оплаты — поблагодари, скажи что отправишь в течение 2 дней и дашь трек-номер"""
+5. СТРОГО: когда покупатель выбирает товар — сначала уточни способ доставки, затем запроси ФИО, адрес и телефон, затем отправь реквизиты
+6. СТРОГО ЗАПРЕЩЕНО писать ПОКУПКА: пока покупатель не написал что уже перевёл деньги (слова: перевёл, оплатил, перевео, скинул)
+7. После слова ПОКУПКА: — поблагодари, скажи что отправишь в течение 2 дней и дашь трек-номер"""
 
 
 # ── Хендлеры ───────────────────────────────────────────────────
@@ -314,16 +328,22 @@ def build_system_prompt(inventory_text: str) -> str:
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     await clear_history(chat_id)
-    order_context[chat_id] = {"name": "", "size": "", "price": 0, "article": ""}
+    order_context[chat_id] = {
+        "name": "", "size": "", "price": 0, "article": "",
+        "recipient_name": "", "recipient_address": "", "recipient_phone": ""
+    }
     await update.message.reply_text(
-        "Привет! Я менеджер магазина LOCAL Store.\n\nУ нас большой выбор брендовой одежды — Bape, CDG, Y3, Гоша Рубчинский и другие. Чем могу помочь? 😊"
+        "Здравствуйте! Добро пожаловать в LOCAL Store 😊 У нас большой выбор одежды от топовых брендов — Bape, CDG, Y3, Гоша Рубчинский и другие. Что Вас интересует?"
     )
 
 
 async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     await clear_history(chat_id)
-    order_context[chat_id] = {"name": "", "size": "", "price": 0, "article": ""}
+    order_context[chat_id] = {
+        "name": "", "size": "", "price": 0, "article": "",
+        "recipient_name": "", "recipient_address": "", "recipient_phone": ""
+    }
     await update.message.reply_text("Диалог сброшен. Начинаем заново!")
 
 
@@ -340,7 +360,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_name = update.effective_user.first_name or "Покупатель"
 
     if is_spam(chat_id):
-        await update.message.reply_text("Чуть помедленнее! Отвечу на все вопросы по очереди 😊")
+        await update.message.reply_text("Чуть помедленнее, отвечу на все вопросы по очереди 😊")
         return
 
     await context.bot.send_chat_action(chat_id=chat_id, action="typing")
@@ -348,7 +368,6 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         photo = update.message.photo[-1]
         file = await context.bot.get_file(photo.file_id)
-
         async with httpx.AsyncClient(timeout=15) as http:
             resp = await http.get(file.file_path)
             photo_bytes = resp.content
@@ -357,10 +376,8 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply = await analyze_photo(photo_bytes, inventory_text)
 
         _update_order_context(chat_id, reply, inventory_items)
-
         await save_message(chat_id, "user", f"{user_name}: [прислал фото]")
         await save_message(chat_id, "assistant", reply)
-
         await update.message.reply_text(reply)
 
     except Exception as e:
@@ -373,15 +390,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_text = update.message.text
     user_name = update.effective_user.first_name or "Покупатель"
 
-    # Антиспам
     if is_spam(chat_id):
-        await update.message.reply_text("Чуть помедленнее! Отвечу на все вопросы по очереди 😊")
+        await update.message.reply_text("Чуть помедленнее, отвечу на все вопросы по очереди 😊")
         return
 
     inventory_text, inventory_items = await get_inventory()
     _update_order_context(chat_id, user_text, inventory_items)
 
-    # Загружаем историю из БД
     history = await load_history(chat_id)
     history.append({"role": "user", "content": f"{user_name}: {user_text}"})
     if len(history) > 20:
@@ -390,7 +405,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await context.bot.send_chat_action(chat_id=chat_id, action="typing")
 
     try:
-        # Торг → Sonnet, остальное → Haiku
         is_negotiation = any(w in user_text.lower() for w in ["скидк", "дешевле", "уступ", "торг", "снизь"])
         model = "claude-sonnet-4-6" if is_negotiation else "claude-haiku-4-5-20251001"
 
@@ -403,8 +417,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply = response.content[0].text
 
         _update_order_context(chat_id, reply, inventory_items)
-
-        # Сохраняем в БД
         await save_message(chat_id, "user", f"{user_name}: {user_text}")
         await save_message(chat_id, "assistant", reply)
 
@@ -415,21 +427,25 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(clean)
             await context.bot.send_message(
                 chat_id=OWNER_CHAT_ID,
-                text=f"ЭСКАЛАЦИЯ от {user_name}!\nСообщение: {user_text}\nОтвет: {clean}"
+                text=f"🚨 ЭСКАЛАЦИЯ от {user_name}!\nСообщение: {user_text}\nОтвет: {clean}"
             )
         elif is_sale:
             clean = reply.replace("ПОКУПКА:", "").strip()
             await update.message.reply_text(clean)
             order = await notify_sale(user_name, chat_id)
-            status = "Записано в таблицу" if order["name"] else "Товар не определён — проверь таблицу"
+            ctx = order_context.get(chat_id, {})
+            status = "✅ Записано в таблицу" if order["name"] else "⚠️ Товар не определён — проверь таблицу"
             await context.bot.send_message(
                 chat_id=OWNER_CHAT_ID,
-                text=f"Новый заказ!\n"
+                text=f"🛍 Новый заказ!\n"
                      f"Покупатель: {user_name}\n"
                      f"Товар: {order['name'] or '?'}\n"
                      f"Размер: {order['size'] or '?'}\n"
                      f"Цена: {order['price'] or '?'} руб.\n"
                      f"Артикул: {order['article'] or '?'}\n"
+                     f"ФИО: {ctx.get('recipient_name') or '?'}\n"
+                     f"Адрес: {ctx.get('recipient_address') or '?'}\n"
+                     f"Телефон: {ctx.get('recipient_phone') or '?'}\n"
                      f"{status}"
             )
         else:
@@ -441,8 +457,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 def main():
-    import asyncio
-
     async def post_init(app):
         await init_db()
 
