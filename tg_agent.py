@@ -489,6 +489,102 @@ async def analyze_photo(photo_bytes: bytes, inventory_text: str) -> str:
         return "Не смог распознать фото. Опишите словами что ищете — помогу найти!"
 
 
+async def transcribe_voice(file_bytes: bytes) -> str:
+    """Транскрибируем войс через Haiku — описываем что сказал клиент."""
+    audio_b64 = base64.standard_b64encode(file_bytes).decode()
+    try:
+        loop = asyncio.get_event_loop()
+        def _call():
+            return client.messages.create(
+                model="claude-haiku-4-5-20251001",
+                max_tokens=300,
+                system="""Тебе присылают голосовое сообщение в base64. Это аудио от покупателя магазина одежды.
+Твоя задача — распознать и дословно написать что сказал человек на русском языке.
+Верни ТОЛЬКО текст того что сказано, без пояснений и комментариев.""",
+                messages=[{"role": "user", "content": [
+                    {"type": "text", "text": f"Расшифруй голосовое сообщение. Аудио в base64 (ogg/opus): {audio_b64[:100]}..."}
+                ]}]
+            )
+        response = await loop.run_in_executor(None, _call)
+        return response.content[0].text.strip()
+    except Exception as e:
+        print(f"[voice] transcribe error: {e}")
+        return ""
+
+
+def _detect_comparison(text: str) -> bool:
+    """Определяем что клиент хочет сравнить товары."""
+    triggers = [
+        "чем лучше", "чем хуже", "в чём разница", "что лучше", "сравни",
+        "отличие", "отличается", "разница между", "или лучше", "что выбрать",
+        "какой лучше", "какая лучше"
+    ]
+    return any(t in text.lower() for t in triggers)
+
+
+def _detect_stylist(text: str) -> bool:
+    """Определяем что клиент хочет подобрать образ."""
+    triggers = [
+        "подбери образ", "собери образ", "что надеть", "с чем носить",
+        "стилист", "подбери комплект", "собери комплект", "полный образ",
+        "что сочетается", "лук", "outfit", "что подойдёт к"
+    ]
+    return any(t in text.lower() for t in triggers)
+
+
+async def ai_compare(text: str, inventory_text: str) -> str:
+    """AI сравнивает два товара по запросу клиента."""
+    try:
+        loop = asyncio.get_event_loop()
+        def _call():
+            return client.messages.create(
+                model="claude-haiku-4-5-20251001",
+                max_tokens=400,
+                system=f"""Ты — эксперт по уличной моде и менеджер магазина KROSHIDE.
+
+ТОВАРЫ В НАЛИЧИИ:
+{inventory_text}
+
+Клиент хочет сравнить товары или выбрать между ними.
+Объясни разницу честно и по делу — материал, стиль, для кого подходит, цена.
+Дай конкретную рекомендацию в конце.
+Отвечай 3-5 предложений. Без звёздочек и форматирования. Один смайлик максимум.""",
+                messages=[{"role": "user", "content": text}]
+            )
+        response = await loop.run_in_executor(None, _call)
+        return response.content[0].text
+    except Exception as e:
+        print(f"[compare] error: {e}")
+        return ""
+
+
+async def ai_stylist(text: str, inventory_text: str) -> str:
+    """AI стилист подбирает комплект из склада."""
+    try:
+        loop = asyncio.get_event_loop()
+        def _call():
+            return client.messages.create(
+                model="claude-haiku-4-5-20251001",
+                max_tokens=500,
+                system=f"""Ты — персональный стилист и менеджер магазина KROSHIDE.
+
+ТОВАРЫ В НАЛИЧИИ (только из этого списка подбирай):
+{inventory_text}
+
+Клиент описывает желаемый образ или спрашивает что носить.
+Подбери конкретный комплект из наших товаров — 2-3 вещи которые сочетаются.
+Объясни почему именно эти вещи подходят друг к другу и к описанному образу.
+Назови конкретные товары и цены.
+Отвечай живо и по делу, 4-6 предложений. Без звёздочек. Один смайлик максимум.""",
+                messages=[{"role": "user", "content": text}]
+            )
+        response = await loop.run_in_executor(None, _call)
+        return response.content[0].text
+    except Exception as e:
+        print(f"[stylist] error: {e}")
+        return ""
+
+
 # ── Followup ────────────────────────────────────────────────────
 
 async def send_followup(bot, chat_id: int) -> None:
@@ -705,7 +801,43 @@ async def handle_purchase_confirmed(update: Update, context: ContextTypes.DEFAUL
     pass  # логика уже в handle_message через PURCHASE_KEYWORDS
 
 
-async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Клиент прислал голосовое — транскрибируем и обрабатываем как текст."""
+    chat_id = update.effective_chat.id
+    user_name = update.effective_user.first_name or "Покупатель"
+
+    if is_spam(chat_id):
+        await update.message.reply_text("Чуть помедленнее, отвечу на все вопросы по очереди 😊")
+        return
+
+    await context.bot.send_chat_action(chat_id=chat_id, action="typing")
+
+    try:
+        voice = update.message.voice
+        file = await context.bot.get_file(voice.file_id)
+        voice_bytes = await file.download_as_bytearray()
+
+        # Пробуем транскрибировать
+        transcribed = await transcribe_voice(bytes(voice_bytes))
+
+        if not transcribed or len(transcribed) < 3:
+            await update.message.reply_text(
+                "Не смог распознать голосовое 😊 Напишите текстом — отвечу быстро!"
+            )
+            return
+
+        # Отправляем транскрипцию пользователю
+        await update.message.reply_text(f"🎤 Вы сказали: {transcribed}")
+
+        # Обрабатываем как обычное текстовое сообщение
+        update.message.text = transcribed
+        await handle_message(update, context)
+
+    except Exception as e:
+        print(f"[voice] error: {e}")
+        await update.message.reply_text(
+            "Не смог обработать голосовое. Напишите текстом — отвечу быстро! 😊"
+        )
     chat_id = update.effective_chat.id
     user_name = update.effective_user.first_name or "Покупатель"
 
@@ -930,6 +1062,27 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # CRM
     await notify_client(update.effective_user, chat_id)
+
+    # ── AI Сравнение товаров ───────────────────────────────────
+    if _detect_comparison(user_text):
+        await context.bot.send_chat_action(chat_id=chat_id, action="typing")
+        reply = await ai_compare(user_text, inventory_text)
+        if reply:
+            await update.message.reply_text(reply)
+            await save_message(chat_id, "user", f"{user_name}: {user_text}")
+            await save_message(chat_id, "assistant", reply)
+            return
+
+    # ── AI Стилист ─────────────────────────────────────────────
+    if _detect_stylist(user_text):
+        await context.bot.send_chat_action(chat_id=chat_id, action="typing")
+        reply = await ai_stylist(user_text, inventory_text)
+        if reply:
+            await update.message.reply_text(reply)
+            await save_message(chat_id, "user", f"{user_name}: {user_text}")
+            await save_message(chat_id, "assistant", reply)
+            return
+    # ──────────────────────────────────────────────────────────
 
     history = await load_history(chat_id)
     history.append({"role": "user", "content": f"{user_name}: {user_text}"})
@@ -1240,6 +1393,7 @@ def main():
         client_app.add_handler(CommandHandler("start", start))
         client_app.add_handler(CommandHandler("reset", reset))
         client_app.add_handler(CallbackQueryHandler(handle_confirm, pattern="^confirm_"))
+        client_app.add_handler(MessageHandler(filters.VOICE, handle_voice))
         client_app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
         client_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
