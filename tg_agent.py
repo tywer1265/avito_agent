@@ -1063,25 +1063,60 @@ async def handle_owner_commands(update: Update, context: ContextTypes.DEFAULT_TY
 
 
 async def handle_owner_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Владелец прислал фото — сохраняем если ждём."""
+    """Владелец прислал фото — скачиваем и перезаливаем через клиентский бот."""
     owner_chat_id = update.effective_chat.id
     if owner_chat_id not in pending_photo_article:
         return  # не ждём фото — игнорируем
 
     article = pending_photo_article[owner_chat_id]
-    # Берём самое большое фото
-    photo = update.message.photo[-1]
-    file_id = photo.file_id
 
-    success = await save_product_photo(article, file_id)
-    if success:
-        photos = await get_product_photos(article)
-        await update.message.reply_text(
-            f"✅ Фото сохранено! Артикул: {article} — всего {len(photos)} фото\n"
-            f"Кидай ещё или напиши /done"
-        )
-    else:
-        await update.message.reply_text("❌ Ошибка сохранения фото, попробуй ещё раз")
+    try:
+        # Скачиваем фото через бота владельца
+        photo = update.message.photo[-1]
+        file = await context.bot.get_file(photo.file_id)
+        photo_bytes = await file.download_as_bytearray()
+
+        # Перезаливаем через клиентский бот чтобы получить его file_id
+        client_token = os.getenv("CLIENT_BOT_TOKEN")
+        async with httpx.AsyncClient(timeout=30) as http:
+            resp = await http.post(
+                f"https://api.telegram.org/bot{client_token}/sendPhoto",
+                params={"chat_id": OWNER_CHAT_ID},
+                files={"photo": ("photo.jpg", bytes(photo_bytes), "image/jpeg")}
+            )
+            data = resp.json()
+
+        if not data.get("ok"):
+            await update.message.reply_text(f"❌ Ошибка загрузки: {data.get('description')}")
+            return
+
+        # Берём file_id от клиентского бота
+        client_file_id = data["result"]["photo"][-1]["file_id"]
+
+        # Удаляем служебное сообщение которое отправили в чат владельца
+        try:
+            msg_id = data["result"]["message_id"]
+            async with httpx.AsyncClient(timeout=5) as http:
+                await http.post(
+                    f"https://api.telegram.org/bot{client_token}/deleteMessage",
+                    params={"chat_id": OWNER_CHAT_ID, "message_id": msg_id}
+                )
+        except Exception:
+            pass
+
+        success = await save_product_photo(article, client_file_id)
+        if success:
+            photos = await get_product_photos(article)
+            await update.message.reply_text(
+                f"✅ Фото сохранено! Артикул: {article} — всего {len(photos)} фото\n"
+                f"Кидай ещё или напиши /done"
+            )
+        else:
+            await update.message.reply_text("❌ Ошибка сохранения в БД")
+
+    except Exception as e:
+        print(f"[owner_photo] error: {e}")
+        await update.message.reply_text(f"❌ Ошибка: {e}")
 
 
 def main():
