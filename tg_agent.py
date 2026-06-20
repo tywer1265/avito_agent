@@ -33,6 +33,8 @@ paused_chats = {}  # chat_id → timestamp когда поставлен на п
 db_pool = None
 _inventory_cache: tuple[str, list, float] = ("", [], 0.0)
 pending_photo_article = {}  # owner_chat_id → article (ждём фото от владельца)
+retargeting_tasks = {}  # chat_id → asyncio.Task ретаргетинга через 24ч
+upsell_sent = set()  # chat_id где уже отправили upsell
 
 
 # ── База данных ────────────────────────────────────────────────
@@ -443,7 +445,8 @@ async def get_inventory() -> tuple[str, list]:
             if not items:
                 return "Склад временно недоступен", []
             lines = [
-                f"- {i['name']} ({i['size']}): {i['price']}₽, остаток: {i['stock']} шт"
+                f"- {i['name']} ({i['size']}): {i['price']}₽, остаток: {i['stock']} шт" +
+                (" ⚠️ ПОСЛЕДНИЙ" if int(i.get('stock', 99)) <= 2 else "")
                 for i in items
             ]
             text = "\n".join(lines)
@@ -616,6 +619,94 @@ def cancel_followup(chat_id: int) -> None:
         print(f"[followup] отменён для {chat_id}")
 
 
+# ── Ретаргетинг через 24ч ──────────────────────────────────────
+
+async def send_retargeting(bot, chat_id: int, product_name: str, size: str) -> None:
+    try:
+        await asyncio.sleep(24 * 60 * 60)
+        if chat_id in retargeting_tasks:
+            item_text = f" ({product_name}, размер {size})" if product_name else ""
+            msg = f"Кстати, вы смотрели у нас товар{item_text} — он ещё в наличии 😊 Если остались вопросы или хотите оформить — напишите, помогу!"
+            await bot.send_message(chat_id=chat_id, text=msg)
+            del retargeting_tasks[chat_id]
+            print(f"[retargeting] отправлено {chat_id}")
+    except asyncio.CancelledError:
+        pass
+    except Exception as e:
+        print(f"[retargeting] error: {e}")
+
+
+def schedule_retargeting(bot, chat_id: int, product_name: str = "", size: str = "") -> None:
+    cancel_retargeting(chat_id)
+    task = asyncio.create_task(send_retargeting(bot, chat_id, product_name, size))
+    retargeting_tasks[chat_id] = task
+    print(f"[retargeting] запланирован для {chat_id} ({product_name})")
+
+
+def cancel_retargeting(chat_id: int) -> None:
+    if chat_id in retargeting_tasks:
+        retargeting_tasks[chat_id].cancel()
+        del retargeting_tasks[chat_id]
+
+
+# ── Дефицит — последний размер ─────────────────────────────────
+
+def _check_deficit(inventory_items: list, article: str, size: str) -> bool:
+    """Проверяем остаток товара — если ≤2 шт возвращаем True."""
+    for item in inventory_items:
+        if str(item.get("article", "")).upper() == article.upper():
+            stock = item.get("stock", 99)
+            try:
+                return int(stock) <= 2
+            except Exception:
+                return False
+    return False
+
+
+# ── Upsell ─────────────────────────────────────────────────────
+
+async def send_upsell(bot, chat_id: int, current_article: str, inventory_items: list) -> None:
+    """Через 30 сек после покупки предлагаем второй товар."""
+    try:
+        await asyncio.sleep(30)
+        if chat_id in upsell_sent:
+            return
+        # Ищем товар другого типа из той же ценовой категории
+        ctx = order_context.get(chat_id, {})
+        current_price = ctx.get("price", 0)
+        current_name = ctx.get("name", "").lower()
+
+        candidates = []
+        for item in inventory_items:
+            if str(item.get("article", "")).upper() == current_article.upper():
+                continue
+            item_name = str(item.get("name", "")).lower()
+            # Не предлагаем тот же тип
+            if any(t in current_name and t in item_name for t in ["худи", "футболк", "лонгслив", "свитшот", "поло"]):
+                continue
+            item_price = item.get("price", 0)
+            try:
+                item_price = int(item_price)
+            except Exception:
+                continue
+            if item_price > 0 and int(item.get("stock", 0)) > 0:
+                candidates.append(item)
+
+        if not candidates:
+            return
+
+        # Берём первый подходящий
+        pick = candidates[0]
+        upsell_sent.add(chat_id)
+        msg = f"Кстати, к вашему заказу отлично подойдёт {pick['name']} — {pick['price']}₽. Хотите покажу фото? 😊"
+        await bot.send_message(chat_id=chat_id, text=msg)
+        print(f"[upsell] отправлено {chat_id}: {pick['name']}")
+    except asyncio.CancelledError:
+        pass
+    except Exception as e:
+        print(f"[upsell] error: {e}")
+
+
 # ── CRM / Уведомления ──────────────────────────────────────────
 
 async def notify_client(user: object, chat_id: int) -> None:
@@ -729,7 +820,8 @@ def build_system_prompt(inventory_text: str) -> str:
 5. СТРОГО: когда покупатель выбирает товар — сначала уточни способ доставки, затем напиши ТОЛЬКО "Подскажите пожалуйста Ваше полное ФИО для оформления заказа." — адрес и телефон система запросит сама
 6. СТРОГО ЗАПРЕЩЕНО писать ПОКУПКА: пока покупатель не написал что уже перевёл деньги (слова: перевёл, оплатил, перевео, скинул)
 7. После слова ПОКУПКА: — поблагодари, скажи что отправишь в течение 2 дней и дашь трек-номер
-8. СТРОГО: если покупатель просит фото — отвечай ТОЛЬКО "Сейчас пришлю фото!" и больше ничего. Система сама отправит фото автоматически. НИКОГДА не говори что не можешь отправить фото."""
+8. СТРОГО: если покупатель просит фото — отвечай ТОЛЬКО "Сейчас пришлю фото!" и больше ничего. Система сама отправит фото автоматически. НИКОГДА не говори что не можешь отправить фото.
+9. Если у товара пометка ⚠️ ПОСЛЕДНИЙ — обязательно упомяни это: "последний размер", "остался один", "торопитесь". Создай ощущение срочности."""
 
 
 # ── Хендлеры ───────────────────────────────────────────────────
@@ -1066,6 +1158,15 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # CRM
     await notify_client(update.effective_user, chat_id)
 
+    # Запускаем ретаргетинг — если клиент не купит через 24ч, напомним
+    ctx_now = order_context.get(chat_id, {})
+    if ctx_now.get("name") and ctx_now.get("state") not in ["waiting_fio", "waiting_address", "waiting_phone", "waiting_confirm"]:
+        schedule_retargeting(
+            context.bot, chat_id,
+            ctx_now.get("name", ""),
+            ctx_now.get("size", "")
+        )
+
     # ── AI Сравнение товаров ───────────────────────────────────
     if _detect_comparison(user_text):
         await context.bot.send_chat_action(chat_id=chat_id, action="typing")
@@ -1129,8 +1230,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             after_payment_msg = "Спасибо за заказ! Передал его на сборку, отправка будет в течение 3х дней, ожидайте. Трек номер пришлю чуть позже! ♥️"
             await update.message.reply_text(after_payment_msg)
             cancel_followup(chat_id)
+            cancel_retargeting(chat_id)  # отменяем ретаргетинг — купил
             order = await notify_sale(user_name, chat_id)
+            # Запускаем upsell через 30 сек
             ctx = order_context.get(chat_id, {})
+            article = ctx.get("article", "")
+            if article and chat_id not in upsell_sent:
+                asyncio.create_task(send_upsell(context.bot, chat_id, article, inventory_items))
             status = "✅ Записано в таблицу" if order["name"] else "⚠️ Товар не определён — проверь таблицу"
             alert_text = (
                 f"🛍 Новый заказ!\n"
