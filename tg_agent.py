@@ -17,6 +17,7 @@ DATABASE_URL = os.getenv("DATABASE_URL_ASYNCPG", os.getenv("DATABASE_URL", "").r
 N8N_INVENTORY_URL = "https://tywer1265.app.n8n.cloud/webhook/inventory"
 N8N_ORDERS_URL = "https://tywer1265.app.n8n.cloud/webhook/orders/new"
 N8N_CLIENTS_URL = "https://tywer1265.app.n8n.cloud/webhook/clients"
+HQ_CHAT_ID = -1004385799918  # KROSHIDE HQ групповой чат
 
 MAX_MESSAGES_PER_MINUTE = 10
 
@@ -76,7 +77,19 @@ async def init_db():
                 CREATE INDEX IF NOT EXISTS idx_product_photos_article
                 ON product_photos(article)
             """)
-        print("[db] Подключено, таблицы tg_conversations и product_photos готовы")
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS wishlist (
+                    id BIGSERIAL PRIMARY KEY,
+                    chat_id BIGINT NOT NULL,
+                    user_name TEXT DEFAULT '',
+                    article VARCHAR(64) NOT NULL,
+                    product_name TEXT NOT NULL,
+                    size VARCHAR(16) NOT NULL,
+                    created_at TIMESTAMPTZ DEFAULT NOW(),
+                    UNIQUE(chat_id, article, size)
+                )
+            """)
+        print("[db] Подключено, таблицы готовы")
     except Exception as e:
         print(f"[db] Ошибка подключения: {e}")
         db_pool = None
@@ -248,6 +261,60 @@ async def find_article_by_name(name_part: str, inventory_items: list) -> str:
         if name_lower in str(item.get("name", "")).lower():
             return str(item.get("article", ""))
     return ""
+
+
+# ── Вишлист ────────────────────────────────────────────────────
+
+async def wishlist_add(chat_id: int, user_name: str, article: str, product_name: str, size: str) -> bool:
+    if not db_pool:
+        return False
+    try:
+        async with db_pool.acquire() as conn:
+            await conn.execute("""
+                INSERT INTO wishlist (chat_id, user_name, article, product_name, size)
+                VALUES ($1, $2, $3, $4, $5)
+                ON CONFLICT (chat_id, article, size) DO NOTHING
+            """, chat_id, user_name, article.upper(), product_name, size.upper())
+        return True
+    except Exception as e:
+        print(f"[wishlist] add error: {e}")
+        return False
+
+
+async def wishlist_notify(bot, article: str, size: str) -> int:
+    """Уведомляем всех кто ждёт этот товар+размер."""
+    if not db_pool:
+        return 0
+    try:
+        async with db_pool.acquire() as conn:
+            rows = await conn.fetch("""
+                SELECT chat_id, product_name FROM wishlist
+                WHERE UPPER(article) = $1 AND UPPER(size) = $2
+            """, article.upper(), size.upper())
+
+        count = 0
+        for row in rows:
+            try:
+                await bot.send_message(
+                    chat_id=row["chat_id"],
+                    text=f"Привет! Вы ждали {row['product_name']} размер {size} — он снова появился в наличии 😊 Хотите оформить заказ?"
+                )
+                count += 1
+            except Exception as e:
+                print(f"[wishlist] notify error for {row['chat_id']}: {e}")
+
+        # Удаляем уведомлённых
+        if rows:
+            async with db_pool.acquire() as conn:
+                await conn.execute("""
+                    DELETE FROM wishlist
+                    WHERE UPPER(article) = $1 AND UPPER(size) = $2
+                """, article.upper(), size.upper())
+
+        return count
+    except Exception as e:
+        print(f"[wishlist] notify error: {e}")
+        return 0
 
 
 # ── Антиспам ───────────────────────────────────────────────────
@@ -893,7 +960,71 @@ async def handle_purchase_confirmed(update: Update, context: ContextTypes.DEFAUL
     pass  # логика уже в handle_message через PURCHASE_KEYWORDS
 
 
-async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def handle_hq_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик сообщений в KROSHIDE HQ группе."""
+    if update.effective_chat.id != HQ_CHAT_ID:
+        return
+
+    thread_id = update.message.message_thread_id
+    text = update.message.text or ""
+
+    # Логируем thread_id для настройки тем
+    print(f"[hq] thread_id={thread_id} text={text[:50]}")
+
+    # Убираем обращение из текста
+    clean_text = text
+    for t in TEMA_TRIGGERS:
+        clean_text = clean_text.lower().replace(t, "").strip()
+
+    # Берём thread_id из входящего — отвечаем в ту же тему
+    thread_id = update.message.message_thread_id
+
+    await context.bot.send_chat_action(
+        chat_id=HQ_CHAT_ID,
+        action="typing",
+        message_thread_id=thread_id
+    )
+
+    inventory_text, inventory_items = await get_inventory()
+
+    try:
+        loop = asyncio.get_event_loop()
+        def _call():
+            return client.messages.create(
+                model="claude-haiku-4-5-20251001",
+                max_tokens=600,
+                system=f"""Ты — Тёма, AI менеджер магазина KROSHIDE.
+Ты в рабочем групповом чате KROSHIDE Online Office вместе с владельцем Артёмом.
+Отвечай коротко и по делу. Это рабочий чат, не продажи.
+
+СКЛАД:
+{inventory_text}
+
+Что умеешь:
+- Остатки и наличие товаров
+- Статус вишлиста
+- Ответы на вопросы по работе магазина
+- Выполнение команд
+
+Отвечай чётко, с цифрами. Без лишних слов.""",
+                messages=[{"role": "user", "content": clean_text or text}]
+            )
+        response = await loop.run_in_executor(None, _call)
+        reply = response.content[0].text
+
+        await context.bot.send_message(
+            chat_id=HQ_CHAT_ID,
+            text=f"🤖 Тёма: {reply}",
+            message_thread_id=thread_id
+        )
+
+    except Exception as e:
+        print(f"[hq] tema error: {e}")
+        await context.bot.send_message(
+            chat_id=HQ_CHAT_ID,
+            text="❌ Тёма: ошибка, попробуй ещё раз",
+            message_thread_id=thread_id
+        )
     """Клиент прислал голосовое — транскрибируем и обрабатываем как текст."""
     chat_id = update.effective_chat.id
     user_name = update.effective_user.first_name or "Покупатель"
@@ -1273,6 +1404,21 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 order_context[chat_id]["recipient_address"] = ""
                 order_context[chat_id]["recipient_phone"] = ""
 
+            # Вишлист — если агент говорит что нет размера
+            NO_SIZE_TRIGGERS = ["нет в наличии", "нет такого размера", "такого размера нет",
+                                "закончился", "нет размера", "к сожалению нет", "не осталось"]
+            if any(t in reply_lower for t in NO_SIZE_TRIGGERS):
+                ctx = order_context.get(chat_id, {})
+                article = ctx.get("article", "")
+                product_name = ctx.get("name", "")
+                size = ctx.get("size", "")
+                if article and size:
+                    await wishlist_add(chat_id, user_name, article, product_name, size)
+                    await context.bot.send_message(
+                        chat_id=chat_id,
+                        text=f"Записал вас в лист ожидания на {product_name} размер {size} — напишу как только появится 😊"
+                    )
+
     except Exception as e:
         await update.message.reply_text("Секунду, уточню информацию и отвечу!")
         print(f"Error: {e}")
@@ -1385,8 +1531,29 @@ async def handle_owner_commands(update: Update, context: ContextTypes.DEFAULT_TY
         deleted = await delete_product_photos(article)
         await update.message.reply_text(f"🗑 Удалено {deleted} фото для артикула {article}")
 
-    # /done — заканчиваем загрузку фото
-    elif text.strip() == "/done":
+    # /notify артикул размер — уведомить вишлист
+    elif text.startswith("/notify"):
+        parts = text.split()
+        if len(parts) < 3:
+            await update.message.reply_text("Использование: /notify АРТИКУЛ РАЗМЕР\nПример: /notify BAPE-001 L")
+            return
+        article = parts[1].upper()
+        size = parts[2].upper()
+        count = await wishlist_notify(context.bot, article, size)
+        await update.message.reply_text(f"✅ Уведомлено {count} покупателей из вишлиста ({article} / {size})")
+
+    # /wishlist — показать весь список ожидания
+    elif text.startswith("/wishlist"):
+        if not db_pool:
+            await update.message.reply_text("БД недоступна")
+            return
+        async with db_pool.acquire() as conn:
+            rows = await conn.fetch("SELECT product_name, size, user_name, chat_id FROM wishlist ORDER BY product_name, size")
+        if not rows:
+            await update.message.reply_text("Вишлист пуст")
+            return
+        lines = [f"• {r['product_name']} / {r['size']} — {r['user_name']} (id:{r['chat_id']})" for r in rows]
+        await update.message.reply_text("📋 Вишлист:\n" + "\n".join(lines))
         owner_chat_id = update.effective_chat.id
         if owner_chat_id in pending_photo_article:
             article = pending_photo_article.pop(owner_chat_id)
@@ -1492,6 +1659,7 @@ def main():
         client_app.add_handler(CommandHandler("start", start))
         client_app.add_handler(CommandHandler("reset", reset))
         client_app.add_handler(CallbackQueryHandler(handle_confirm, pattern="^confirm_"))
+        client_app.add_handler(MessageHandler(filters.Chat(HQ_CHAT_ID) & filters.TEXT, handle_hq_message))
         client_app.add_handler(MessageHandler(filters.VOICE, handle_voice))
         client_app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
         client_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
@@ -1519,12 +1687,58 @@ def main():
             owner_app.add_handler(CommandHandler("deletephoto", handle_owner_commands))
             owner_app.add_handler(CommandHandler("listphotos", handle_owner_commands))
             owner_app.add_handler(CommandHandler("done", handle_owner_commands))
+            owner_app.add_handler(CommandHandler("notify", handle_owner_commands))
+            owner_app.add_handler(CommandHandler("wishlist", handle_owner_commands))
             owner_app.add_handler(MessageHandler(filters.PHOTO, handle_owner_photo))
             owner_app.add_handler(MessageHandler(filters.TEXT & filters.REPLY, handle_owner_reply))
             await owner_app.initialize()
             await owner_app.start()
             await owner_app.updater.start_polling(drop_pending_updates=True)
             print("Оба бота запущены")
+
+            # Стартовое сообщение владельцу
+            now = datetime.now().strftime("%d.%m.%Y %H:%M")
+            try:
+                owner_token = os.getenv("TELEGRAM_BOT_TOKEN")
+                async with httpx.AsyncClient(timeout=5) as http:
+                    await http.post(
+                        f"https://api.telegram.org/bot{owner_token}/sendMessage",
+                        json={
+                            "chat_id": OWNER_CHAT_ID,
+                            "text": (
+                                f"🚀 KROSHIDE AI technologies development запущен\n\n"
+                                f"Агенты на линии:\n"
+                                f"• Тёма — менеджер покупателей (@oqwiendowqej3213_bot)\n"
+                                f"• Тимка — бухгалтер и аналитик (@tema22_38bot)\n\n"
+                                f"Время запуска: {now}"
+                            )
+                        }
+                    )
+            except Exception as e:
+                print(f"[startup] notify error: {e}")
+
+            # Сообщение в HQ чат
+            try:
+                client_token = os.getenv("CLIENT_BOT_TOKEN")
+                async with httpx.AsyncClient(timeout=5) as http:
+                    await http.post(
+                        f"https://api.telegram.org/bot{client_token}/sendMessage",
+                        json={
+                            "chat_id": HQ_CHAT_ID,
+                            "text": (
+                                f"🤖 Тёма на связи\n"
+                                f"Время: {now}\n\n"
+                                f"Команды:\n"
+                                f"@Тёма остатки — что заканчивается\n"
+                                f"@Тёма склад — полный список\n"
+                                f"@Тёма незакрытые — диалоги без покупки\n"
+                                f"@Тёма вишлист — кто ждёт товар\n"
+                                f"@Тёма [любой вопрос] — отвечу"
+                            )
+                        }
+                    )
+            except Exception as e:
+                print(f"[startup] hq notify error: {e}")
         else:
             print("Бот покупателей запущен")
 
