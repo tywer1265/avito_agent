@@ -838,6 +838,9 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             "Не смог обработать голосовое. Напишите текстом — отвечу быстро! 😊"
         )
+
+
+async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     user_name = update.effective_user.first_name or "Покупатель"
 
@@ -1067,16 +1070,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if _detect_comparison(user_text):
         await context.bot.send_chat_action(chat_id=chat_id, action="typing")
         reply = await ai_compare(user_text, inventory_text)
-        if reply:
-            await update.message.reply_text(reply)
-            await save_message(chat_id, "user", f"{user_name}: {user_text}")
-            await save_message(chat_id, "assistant", reply)
-            return
-
-    # ── AI Стилист ─────────────────────────────────────────────
-    if _detect_stylist(user_text):
-        await context.bot.send_chat_action(chat_id=chat_id, action="typing")
-        reply = await ai_stylist(user_text, inventory_text)
         if reply:
             await update.message.reply_text(reply)
             await save_message(chat_id, "user", f"{user_name}: {user_text}")
