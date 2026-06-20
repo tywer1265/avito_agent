@@ -755,9 +755,24 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     _update_order_context_sync(chat_id, user_text, inventory_items)
 
     # ── Отправка фото по запросу клиента ──────────────────────
-    PHOTO_TRIGGERS = ["фото", "фотк", "покажи", "покажите", "фоточк", "посмотреть", "как выглядит", "есть фото"]
+    PHOTO_TRIGGERS = ["фото", "фотк", "покажи", "покажите", "фоточк", "посмотреть", "как выглядит", "есть фото", "скинь фото", "скинь мне фото"]
     if any(t in user_text.lower() for t in PHOTO_TRIGGERS):
+        # Сначала берём артикул из контекста
         article = order_context.get(chat_id, {}).get("article", "")
+
+        # Если нет в контексте — ищем по тексту сообщения напрямую
+        if not article:
+            for item in inventory_items:
+                item_name = str(item.get("name", "")).lower()
+                words = [w for w in item_name.split() if len(w) > 2]
+                text_lower = user_text.lower()
+                if words and sum(1 for w in words if w in text_lower) >= max(1, len(words) // 2):
+                    article = str(item.get("article", ""))
+                    if article:
+                        order_context[chat_id]["article"] = article
+                        order_context[chat_id]["name"] = str(item.get("name", ""))
+                        break
+
         if article:
             photos = await get_product_photos(article)
             if photos:
@@ -772,9 +787,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     return
                 except Exception as e:
                     print(f"[photo_send] error: {e}")
-            else:
-                # Фото нет — агент сам ответит что фото нет
-                pass
+            # Фото нет — агент сам ответит
     # ──────────────────────────────────────────────────────────
 
     # Сохраняем способ доставки если упоминается
