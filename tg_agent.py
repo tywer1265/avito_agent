@@ -960,16 +960,85 @@ async def handle_purchase_confirmed(update: Update, context: ContextTypes.DEFAUL
     pass  # логика уже в handle_message через PURCHASE_KEYWORDS
 
 
+HQ_TOPIC_TEMA = 10
+HQ_TOPIC_TIMKA = 13
+HQ_TOPIC_ZAKAZY = 16
+HQ_TOPIC_ZADACHI = 2
+
+
 async def handle_hq_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработчик сообщений в KROSHIDE HQ группе."""
+    """Обработчик сообщений в KROSHIDE Online Office."""
     if update.effective_chat.id != HQ_CHAT_ID:
         return
 
     thread_id = update.message.message_thread_id
-    text = update.message.text or ""
+    text = (update.message.text or "").strip()
 
-    # Логируем thread_id для настройки тем
+    if not text:
+        return
+
     print(f"[hq] thread_id={thread_id} text={text[:50]}")
+
+    # Тема "Тёма" — отвечает на всё
+    if thread_id == HQ_TOPIC_TEMA:
+        await context.bot.send_chat_action(chat_id=HQ_CHAT_ID, action="typing", message_thread_id=thread_id)
+        inventory_text, inventory_items = await get_inventory()
+        try:
+            loop = asyncio.get_event_loop()
+            def _call_tema():
+                return client.messages.create(
+                    model="claude-haiku-4-5-20251001",
+                    max_tokens=600,
+                    system=f"""Ты — Тёма, AI менеджер магазина KROSHIDE.
+Ты в рабочем чате Online Office с владельцем Артёмом.
+Отвечай коротко и по делу. Это рабочий чат, не продажи.
+
+СКЛАД:
+{inventory_text}
+
+Что умеешь:
+- Остатки и наличие товаров
+- Статус вишлиста
+- Ответы на вопросы по работе магазина
+- Любые команды по складу и клиентам
+
+Отвечай чётко, с цифрами. Без лишних слов.""",
+                    messages=[{"role": "user", "content": text}]
+                )
+            response = await loop.run_in_executor(None, _call_tema)
+            reply = response.content[0].text
+            await context.bot.send_message(
+                chat_id=HQ_CHAT_ID,
+                text=f"🤖 {reply}",
+                message_thread_id=thread_id
+            )
+        except Exception as e:
+            print(f"[hq] tema error: {e}")
+            await context.bot.send_message(chat_id=HQ_CHAT_ID, text="❌ Ошибка, попробуй ещё раз", message_thread_id=thread_id)
+
+    # Тема "Заказы" — краткая инфа по заказам
+    elif thread_id == HQ_TOPIC_ZAKAZY:
+        await context.bot.send_chat_action(chat_id=HQ_CHAT_ID, action="typing", message_thread_id=thread_id)
+        inventory_text, _ = await get_inventory()
+        try:
+            loop = asyncio.get_event_loop()
+            def _call_zakazy():
+                return client.messages.create(
+                    model="claude-haiku-4-5-20251001",
+                    max_tokens=400,
+                    system=f"""Ты — Тёма, менеджер KROSHIDE. Отвечаешь на вопросы по заказам.
+СКЛАД: {inventory_text}
+Отвечай коротко и по делу.""",
+                    messages=[{"role": "user", "content": text}]
+                )
+            response = await loop.run_in_executor(None, _call_zakazy)
+            await context.bot.send_message(
+                chat_id=HQ_CHAT_ID,
+                text=f"📦 {response.content[0].text}",
+                message_thread_id=thread_id
+            )
+        except Exception as e:
+            print(f"[hq] zakazy error: {e}")
 
     # Убираем обращение из текста
     clean_text = text
