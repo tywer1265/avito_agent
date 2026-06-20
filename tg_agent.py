@@ -142,10 +142,14 @@ async def get_product_photos(article: str) -> list:
     if not db_pool:
         return []
     try:
+        # Нормализуем артикул — убираем пробелы, переводим в верхний регистр
+        # Заменяем кириллические буквы на латинские (А→A, В→B, С→C и т.д.)
+        cyrillic_to_latin = str.maketrans("АВСЕКМНОРТХавсекмнорТх", "ABCEKMHOPTXabcekmhoptx")
+        article_norm = article.strip().upper().translate(cyrillic_to_latin)
         async with db_pool.acquire() as conn:
             rows = await conn.fetch(
-                "SELECT file_id FROM product_photos WHERE article = $1 ORDER BY created_at ASC",
-                article.upper()
+                "SELECT file_id FROM product_photos WHERE UPPER(article) = $1 ORDER BY created_at ASC",
+                article_norm
             )
         return [r["file_id"] for r in rows]
     except Exception as e:
@@ -561,7 +565,8 @@ def build_system_prompt(inventory_text: str) -> str:
 4. Если товара нет — честно скажи и предложи альтернативу
 5. СТРОГО: когда покупатель выбирает товар — сначала уточни способ доставки, затем напиши ТОЛЬКО "Подскажите пожалуйста Ваше полное ФИО для оформления заказа." — адрес и телефон система запросит сама
 6. СТРОГО ЗАПРЕЩЕНО писать ПОКУПКА: пока покупатель не написал что уже перевёл деньги (слова: перевёл, оплатил, перевео, скинул)
-7. После слова ПОКУПКА: — поблагодари, скажи что отправишь в течение 2 дней и дашь трек-номер"""
+7. После слова ПОКУПКА: — поблагодари, скажи что отправишь в течение 2 дней и дашь трек-номер
+8. СТРОГО: если покупатель просит фото — отвечай ТОЛЬКО "Сейчас пришлю фото!" и больше ничего. Система сама отправит фото автоматически. НИКОГДА не говори что не можешь отправить фото."""
 
 
 # ── Хендлеры ───────────────────────────────────────────────────
