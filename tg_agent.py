@@ -63,8 +63,12 @@ async def init_db():
                     id BIGSERIAL PRIMARY KEY,
                     article VARCHAR(64) NOT NULL,
                     file_id TEXT NOT NULL,
+                    caption TEXT DEFAULT '',
                     created_at TIMESTAMPTZ DEFAULT NOW()
                 )
+            """)
+            await conn.execute("""
+                ALTER TABLE product_photos ADD COLUMN IF NOT EXISTS caption TEXT DEFAULT ''
             """)
             await conn.execute("""
                 CREATE INDEX IF NOT EXISTS idx_product_photos_article
@@ -123,14 +127,14 @@ async def clear_history(chat_id: int):
 
 # ── Фото товаров ───────────────────────────────────────────────
 
-async def save_product_photo(article: str, file_id: str) -> bool:
+async def save_product_photo(article: str, file_id: str, caption: str = "") -> bool:
     if not db_pool:
         return False
     try:
         async with db_pool.acquire() as conn:
             await conn.execute(
-                "INSERT INTO product_photos (article, file_id) VALUES ($1, $2)",
-                article.upper(), file_id
+                "INSERT INTO product_photos (article, file_id, caption) VALUES ($1, $2, $3)",
+                article.upper(), file_id, caption.lower().strip()
             )
         return True
     except Exception as e:
@@ -139,11 +143,10 @@ async def save_product_photo(article: str, file_id: str) -> bool:
 
 
 async def get_product_photos(article: str) -> list:
+    """Возвращает список file_id для артикула."""
     if not db_pool:
         return []
     try:
-        # Нормализуем артикул — убираем пробелы, переводим в верхний регистр
-        # Заменяем кириллические буквы на латинские (А→A, В→B, С→C и т.д.)
         cyrillic_to_latin = str.maketrans("АВСЕКМНОРТХавсекмнорТх", "ABCEKMHOPTXabcekmhoptx")
         article_norm = article.strip().upper().translate(cyrillic_to_latin)
         async with db_pool.acquire() as conn:
@@ -155,6 +158,70 @@ async def get_product_photos(article: str) -> list:
     except Exception as e:
         print(f"[photos] get error: {e}")
         return []
+
+
+async def select_photo_by_vision(file_ids: list, user_request: str, product_name: str) -> list:
+    """Если клиент просит конкретное фото — Haiku смотрит все и выбирает нужное."""
+    # Если запрос общий — возвращаем все
+    SPECIFIC_KEYWORDS = ["принт", "лого", "бирк", "детал", "крупно", "ближе",
+                         "капюшон", "карман", "рукав", "спин", "перед", "этикет"]
+    if not any(kw in user_request.lower() for kw in SPECIFIC_KEYWORDS):
+        return file_ids  # общий запрос — все фото
+
+    if len(file_ids) <= 1:
+        return file_ids  # одно фото — выбирать не из чего
+
+    try:
+        # Скачиваем все фото через клиентский бот
+        client_token = os.getenv("CLIENT_BOT_TOKEN")
+        content = [{"type": "text", "text": f"Покупатель просит: '{user_request}'\nТовар: {product_name}\n\nПосмотри на фото ниже и выбери ТОЛЬКО те которые соответствуют запросу покупателя. Верни ТОЛЬКО номера фото через запятую (1, 2, 3...). Если подходят все — верни 'все'."}]
+
+        for i, file_id in enumerate(file_ids[:10], 1):
+            async with httpx.AsyncClient(timeout=15) as http:
+                resp = await http.get(
+                    f"https://api.telegram.org/bot{client_token}/getFile",
+                    params={"file_id": file_id}
+                )
+                file_data = resp.json()
+                if not file_data.get("ok"):
+                    continue
+                file_path = file_data["result"]["file_path"]
+                img_resp = await http.get(
+                    f"https://api.telegram.org/file/bot{client_token}/{file_path}"
+                )
+                img_b64 = base64.standard_b64encode(img_resp.content).decode()
+                content.append({
+                    "type": "image",
+                    "source": {"type": "base64", "media_type": "image/jpeg", "data": img_b64}
+                })
+                content.append({"type": "text", "text": f"Фото {i}"})
+
+        loop = asyncio.get_event_loop()
+        def _call():
+            return client.messages.create(
+                model="claude-haiku-4-5-20251001",
+                max_tokens=50,
+                messages=[{"role": "user", "content": content}]
+            )
+        response = await loop.run_in_executor(None, _call)
+        answer = response.content[0].text.strip().lower()
+
+        if "все" in answer or "all" in answer:
+            return file_ids
+
+        # Парсим номера
+        numbers = re.findall(r'\d+', answer)
+        selected = []
+        for n in numbers:
+            idx = int(n) - 1
+            if 0 <= idx < len(file_ids):
+                selected.append(file_ids[idx])
+
+        return selected if selected else file_ids
+
+    except Exception as e:
+        print(f"[vision_select] error: {e}")
+        return file_ids  # при ошибке возвращаем все
 
 
 async def delete_product_photos(article: str) -> int:
@@ -765,10 +832,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         # Берём артикул из контекста
         article = order_context.get(chat_id, {}).get("article", "")
+        product_name = order_context.get(chat_id, {}).get("name", "")
 
         # Если нет — ищем по тексту с транслитерацией
         if not article:
-            # Нормализуем: кириллица у3/у2/у1 → y3/y2/y1, бейп→bape и т.д.
             translit = {
                 "у3": "y3", "у2": "y2", "у1": "y1",
                 "бейп": "bape", "бэйп": "bape",
@@ -781,9 +848,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             best_article = ""
             best_score = 0
+            best_name = ""
             for item in inventory_items:
                 item_name = str(item.get("name", "")).lower()
-                # Считаем сколько слов из названия товара есть в тексте
                 words = [w for w in item_name.split() if len(w) > 1]
                 score = sum(1 for w in words if w in text_norm or w in user_text.lower())
                 if score > best_score:
@@ -793,21 +860,24 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             if best_score >= 1 and best_article:
                 article = best_article
+                product_name = best_name
                 order_context[chat_id]["article"] = article
-                order_context[chat_id]["name"] = best_name
+                order_context[chat_id]["name"] = product_name
 
         if article:
-            photos = await get_product_photos(article)
-            print(f"[photo_send] article={article} photos={len(photos)}")
-            if photos:
+            all_photos = await get_product_photos(article)
+            print(f"[photo_send] article={article} total={len(all_photos)}")
+            if all_photos:
                 try:
+                    # Vision выбирает нужные фото если запрос конкретный
+                    selected = await select_photo_by_vision(all_photos, user_text, product_name)
                     from telegram import InputMediaPhoto
                     await context.bot.send_media_group(
                         chat_id=chat_id,
-                        media=[InputMediaPhoto(media=fid) for fid in photos[:10]]
+                        media=[InputMediaPhoto(media=fid) for fid in selected[:10]]
                     )
                     await save_message(chat_id, "user", f"{user_name}: {user_text}")
-                    await save_message(chat_id, "assistant", f"[отправлено {len(photos)} фото для {article}]")
+                    await save_message(chat_id, "assistant", f"[отправлено {len(selected)} фото для {article}]")
                     return
                 except Exception as e:
                     print(f"[photo_send] error: {e}")
@@ -1104,17 +1174,15 @@ async def handle_owner_photo(update: Update, context: ContextTypes.DEFAULT_TYPE)
     """Владелец прислал фото — скачиваем и перезаливаем через клиентский бот."""
     owner_chat_id = update.effective_chat.id
     if owner_chat_id not in pending_photo_article:
-        return  # не ждём фото — игнорируем
+        return
 
     article = pending_photo_article[owner_chat_id]
 
     try:
-        # Скачиваем фото через бота владельца
         photo = update.message.photo[-1]
         file = await context.bot.get_file(photo.file_id)
         photo_bytes = await file.download_as_bytearray()
 
-        # Перезаливаем через клиентский бот чтобы получить его file_id
         client_token = os.getenv("CLIENT_BOT_TOKEN")
         async with httpx.AsyncClient(timeout=30) as http:
             resp = await http.post(
@@ -1128,10 +1196,9 @@ async def handle_owner_photo(update: Update, context: ContextTypes.DEFAULT_TYPE)
             await update.message.reply_text(f"❌ Ошибка загрузки: {data.get('description')}")
             return
 
-        # Берём file_id от клиентского бота
         client_file_id = data["result"]["photo"][-1]["file_id"]
 
-        # Удаляем служебное сообщение которое отправили в чат владельца
+        # Удаляем служебное сообщение
         try:
             msg_id = data["result"]["message_id"]
             async with httpx.AsyncClient(timeout=5) as http:
@@ -1141,6 +1208,9 @@ async def handle_owner_photo(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 )
         except Exception:
             pass
+
+        # Берём описание из подписи к фото если есть
+        caption = update.message.caption or ""
 
         success = await save_product_photo(article, client_file_id)
         if success:
