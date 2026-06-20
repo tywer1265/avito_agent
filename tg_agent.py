@@ -32,6 +32,7 @@ followup_tasks = {}
 paused_chats = {}  # chat_id → timestamp когда поставлен на паузу
 db_pool = None
 _inventory_cache: tuple[str, list, float] = ("", [], 0.0)
+pending_photo_article = {}  # owner_chat_id → article (ждём фото от владельца)
 
 
 # ── База данных ────────────────────────────────────────────────
@@ -57,7 +58,19 @@ async def init_db():
                 CREATE INDEX IF NOT EXISTS idx_tg_conv_chat_id
                 ON tg_conversations(chat_id, created_at DESC)
             """)
-        print("[db] Подключено, таблица tg_conversations готова")
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS product_photos (
+                    id BIGSERIAL PRIMARY KEY,
+                    article VARCHAR(64) NOT NULL,
+                    file_id TEXT NOT NULL,
+                    created_at TIMESTAMPTZ DEFAULT NOW()
+                )
+            """)
+            await conn.execute("""
+                CREATE INDEX IF NOT EXISTS idx_product_photos_article
+                ON product_photos(article)
+            """)
+        print("[db] Подключено, таблицы tg_conversations и product_photos готовы")
     except Exception as e:
         print(f"[db] Ошибка подключения: {e}")
         db_pool = None
@@ -106,6 +119,62 @@ async def clear_history(chat_id: int):
             )
     except Exception as e:
         print(f"[db] clear_history error: {e}")
+
+
+# ── Фото товаров ───────────────────────────────────────────────
+
+async def save_product_photo(article: str, file_id: str) -> bool:
+    if not db_pool:
+        return False
+    try:
+        async with db_pool.acquire() as conn:
+            await conn.execute(
+                "INSERT INTO product_photos (article, file_id) VALUES ($1, $2)",
+                article.upper(), file_id
+            )
+        return True
+    except Exception as e:
+        print(f"[photos] save error: {e}")
+        return False
+
+
+async def get_product_photos(article: str) -> list:
+    if not db_pool:
+        return []
+    try:
+        async with db_pool.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT file_id FROM product_photos WHERE article = $1 ORDER BY created_at ASC",
+                article.upper()
+            )
+        return [r["file_id"] for r in rows]
+    except Exception as e:
+        print(f"[photos] get error: {e}")
+        return []
+
+
+async def delete_product_photos(article: str) -> int:
+    if not db_pool:
+        return 0
+    try:
+        async with db_pool.acquire() as conn:
+            result = await conn.execute(
+                "DELETE FROM product_photos WHERE article = $1",
+                article.upper()
+            )
+        return int(result.split()[-1])
+    except Exception as e:
+        print(f"[photos] delete error: {e}")
+        return 0
+
+
+async def find_article_by_name(name_part: str, inventory_items: list) -> str:
+    """Ищет артикул по части названия товара."""
+    name_lower = name_part.lower()
+    for item in inventory_items:
+        if name_lower in str(item.get("name", "")).lower():
+            return str(item.get("article", ""))
+    return ""
 
 
 # ── Антиспам ───────────────────────────────────────────────────
@@ -321,7 +390,7 @@ async def analyze_photo(photo_bytes: bytes, inventory_text: str) -> str:
             return client.messages.create(
                 model="claude-haiku-4-5-20251001",
                 max_tokens=400,
-                system=f"""Ты — менеджер магазина одежды LOCAL Store.
+                system=f"""Ты — менеджер магазина одежды KROSHIDE.
 Покупатель прислал фото одежды которую хочет купить.
 
 НАШИ ТОВАРЫ В НАЛИЧИИ:
@@ -334,16 +403,13 @@ async def analyze_photo(photo_bytes: bytes, inventory_text: str) -> str:
 4. Если похожего нет — честно скажи и предложи альтернативу
 
 Отвечай на русском, 2-3 предложения. Без звёздочек и форматирования. Один смайлик максимум.""",
-                messages=[{
-                    "role": "user",
-                    "content": [
+                messages=[{"role": "user", "content": [
                         {
                             "type": "image",
                             "source": {"type": "base64", "media_type": "image/jpeg", "data": image_data}
                         },
                         {"type": "text", "text": "Что это за одежда и есть ли у вас похожее?"}
-                    ]
-                }]
+                    ]}]
             )
         response = await loop.run_in_executor(None, _call)
         return response.content[0].text
@@ -432,7 +498,7 @@ async def notify_sale(user_name: str, chat_id: int) -> dict:
 
 
 def build_system_prompt(inventory_text: str) -> str:
-    return f"""Ты — менеджер магазина одежды LOCAL Store. Твоя цель — чтобы каждый покупатель был счастлив и вернулся снова.
+    return f"""Ты — менеджер магазина одежды KROSHIDE. Твоя цель — чтобы каждый покупатель был счастлив и вернулся снова.
 
 ТОВАРЫ В НАЛИЧИИ:
 {inventory_text}
@@ -468,7 +534,7 @@ def build_system_prompt(inventory_text: str) -> str:
 При проблемах писать сюда или менеджеру @KROSHIDEMANAGER.
 
 СТИЛЬ ОБЩЕНИЯ:
-- Твоё имя — Тёма, ты живой менеджер магазина LOCAL Store
+- Твоё имя — Тёма, ты живой менеджер магазина KROSHIDE
 - Если спрашивают кто ты — честно говори что ты Тёма, менеджер магазина
 - Не говори что ты бот или ИИ, но и не отрицай активно — просто веди себя как человек
 - Всегда обращайся на Вы, уважительно и тепло
@@ -509,7 +575,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "delivery": "", "state": "idle"
     }
     await update.message.reply_text(
-        "Здравствуйте! Добро пожаловать в LOCAL Store 😊 У нас большой выбор одежды от топовых брендов — Bape, CDG, Y3, Гоша Рубчинский и другие. Что Вас интересует?"
+        "Добро пожаловать в KROSHIDE 😊 У нас большой выбор одежды от топовых брендов — Bape, CDG, Y3, Гоша Рубчинский и другие. Что Вас интересует?"
     )
 
 
@@ -687,6 +753,29 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Синхронно обновляем товар/размер/цену
     _update_order_context_sync(chat_id, user_text, inventory_items)
+
+    # ── Отправка фото по запросу клиента ──────────────────────
+    PHOTO_TRIGGERS = ["фото", "фотк", "покажи", "покажите", "фоточк", "посмотреть", "как выглядит", "есть фото"]
+    if any(t in user_text.lower() for t in PHOTO_TRIGGERS):
+        article = order_context.get(chat_id, {}).get("article", "")
+        if article:
+            photos = await get_product_photos(article)
+            if photos:
+                try:
+                    from telegram import InputMediaPhoto
+                    await context.bot.send_media_group(
+                        chat_id=chat_id,
+                        media=[InputMediaPhoto(media=fid) for fid in photos[:10]]
+                    )
+                    await save_message(chat_id, "user", f"{user_name}: {user_text}")
+                    await save_message(chat_id, "assistant", f"[отправлено {len(photos)} фото для {article}]")
+                    return
+                except Exception as e:
+                    print(f"[photo_send] error: {e}")
+            else:
+                # Фото нет — агент сам ответит что фото нет
+                pass
+    # ──────────────────────────────────────────────────────────
 
     # Сохраняем способ доставки если упоминается
     delivery_map = {
@@ -887,8 +976,10 @@ async def handle_owner_reply(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 
 async def handle_owner_commands(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Команды владельца: /resume chat_id."""
+    """Команды владельца: /resume chat_id, /addphoto артикул, /deletephoto артикул."""
     text = update.message.text or ""
+
+    # /resume
     if text.startswith("/resume"):
         parts = text.split()
         if len(parts) < 2:
@@ -901,6 +992,96 @@ async def handle_owner_commands(update: Update, context: ContextTypes.DEFAULT_TY
             await update.message.reply_text(f"▶️ Агент включён для покупателя {buyer_chat_id}")
         except ValueError:
             await update.message.reply_text("❌ Неверный chat_id")
+
+    # /addphoto артикул
+    elif text.startswith("/addphoto"):
+        parts = text.split(maxsplit=1)
+        if len(parts) < 2:
+            await update.message.reply_text(
+                "Использование: /addphoto АРТИКУЛ\n"
+                "Пример: /addphoto BAPE-001\n\n"
+                "После команды кидай фото подряд — все сохранятся."
+            )
+            return
+        article = parts[1].strip().upper()
+        owner_chat_id = update.effective_chat.id
+        pending_photo_article[owner_chat_id] = article
+        # Показываем сколько фото уже есть
+        existing = await get_product_photos(article)
+        count_text = f"Уже есть: {len(existing)} фото." if existing else "Фото ещё нет."
+        await update.message.reply_text(
+            f"📸 Жду фото для артикула {article}\n"
+            f"{count_text}\n\n"
+            f"Кидай фото — сохраню все. Когда закончишь, напиши /done"
+        )
+
+    # /deletephoto артикул
+    elif text.startswith("/deletephoto"):
+        parts = text.split(maxsplit=1)
+        if len(parts) < 2:
+            await update.message.reply_text("Использование: /deletephoto АРТИКУЛ")
+            return
+        article = parts[1].strip().upper()
+        deleted = await delete_product_photos(article)
+        await update.message.reply_text(f"🗑 Удалено {deleted} фото для артикула {article}")
+
+    # /done — заканчиваем загрузку фото
+    elif text.strip() == "/done":
+        owner_chat_id = update.effective_chat.id
+        if owner_chat_id in pending_photo_article:
+            article = pending_photo_article.pop(owner_chat_id)
+            photos = await get_product_photos(article)
+            await update.message.reply_text(
+                f"✅ Загрузка завершена!\n"
+                f"Артикул: {article}\n"
+                f"Всего фото: {len(photos)}"
+            )
+        else:
+            await update.message.reply_text("Нет активной загрузки фото.")
+
+    # /listphotos артикул
+    elif text.startswith("/listphotos"):
+        parts = text.split(maxsplit=1)
+        if len(parts) < 2:
+            await update.message.reply_text("Использование: /listphotos АРТИКУЛ")
+            return
+        article = parts[1].strip().upper()
+        photos = await get_product_photos(article)
+        if not photos:
+            await update.message.reply_text(f"❌ Фото для {article} не найдены")
+            return
+        await update.message.reply_text(f"📸 Фото для {article}: {len(photos)} шт. Показываю...")
+        media = [{"type": "photo", "media": fid} for fid in photos[:10]]
+        try:
+            from telegram import InputMediaPhoto
+            await context.bot.send_media_group(
+                chat_id=update.effective_chat.id,
+                media=[InputMediaPhoto(media=fid) for fid in photos[:10]]
+            )
+        except Exception as e:
+            await update.message.reply_text(f"Ошибка показа фото: {e}")
+
+
+async def handle_owner_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Владелец прислал фото — сохраняем если ждём."""
+    owner_chat_id = update.effective_chat.id
+    if owner_chat_id not in pending_photo_article:
+        return  # не ждём фото — игнорируем
+
+    article = pending_photo_article[owner_chat_id]
+    # Берём самое большое фото
+    photo = update.message.photo[-1]
+    file_id = photo.file_id
+
+    success = await save_product_photo(article, file_id)
+    if success:
+        photos = await get_product_photos(article)
+        await update.message.reply_text(
+            f"✅ Фото сохранено! Артикул: {article} — всего {len(photos)} фото\n"
+            f"Кидай ещё или напиши /done"
+        )
+    else:
+        await update.message.reply_text("❌ Ошибка сохранения фото, попробуй ещё раз")
 
 
 def main():
@@ -938,6 +1119,11 @@ def main():
 
         if owner_app:
             owner_app.add_handler(CommandHandler("resume", handle_owner_commands))
+            owner_app.add_handler(CommandHandler("addphoto", handle_owner_commands))
+            owner_app.add_handler(CommandHandler("deletephoto", handle_owner_commands))
+            owner_app.add_handler(CommandHandler("listphotos", handle_owner_commands))
+            owner_app.add_handler(CommandHandler("done", handle_owner_commands))
+            owner_app.add_handler(MessageHandler(filters.PHOTO, handle_owner_photo))
             owner_app.add_handler(MessageHandler(filters.TEXT & filters.REPLY, handle_owner_reply))
             await owner_app.initialize()
             await owner_app.start()
