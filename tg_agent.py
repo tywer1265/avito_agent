@@ -1063,6 +1063,13 @@ async def handle_hq_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
 
+async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Клиент прислал голосовое — просим написать текстом (пока нет OpenAI)."""
+    await update.message.reply_text(
+        "Не смог обработать голосовое. Напишите текстом — отвечу быстро! 😊"
+    )
+
+
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     user_name = update.effective_user.first_name or "Покупатель"
