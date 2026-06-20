@@ -755,26 +755,45 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     _update_order_context_sync(chat_id, user_text, inventory_items)
 
     # ── Отправка фото по запросу клиента ──────────────────────
-    PHOTO_TRIGGERS = ["фото", "фотк", "покажи", "покажите", "фоточк", "посмотреть", "как выглядит", "есть фото", "скинь фото", "скинь мне фото"]
+    PHOTO_TRIGGERS = ["фото", "фотк", "покажи", "покажите", "фоточк", "посмотреть", "как выглядит", "есть фото", "скинь", "пришли фото"]
     if any(t in user_text.lower() for t in PHOTO_TRIGGERS):
-        # Сначала берём артикул из контекста
+
+        # Берём артикул из контекста
         article = order_context.get(chat_id, {}).get("article", "")
 
-        # Если нет в контексте — ищем по тексту сообщения напрямую
+        # Если нет — ищем по тексту с транслитерацией
         if not article:
+            # Нормализуем: кириллица у3/у2/у1 → y3/y2/y1, бейп→bape и т.д.
+            translit = {
+                "у3": "y3", "у2": "y2", "у1": "y1",
+                "бейп": "bape", "бэйп": "bape",
+                "сдг": "cdg", "гоша": "gosha", "рубчинский": "rubchinskiy",
+                "мастермайнд": "mastermind",
+            }
+            text_norm = user_text.lower()
+            for ru, en in translit.items():
+                text_norm = text_norm.replace(ru, en)
+
+            best_article = ""
+            best_score = 0
             for item in inventory_items:
                 item_name = str(item.get("name", "")).lower()
-                words = [w for w in item_name.split() if len(w) > 2]
-                text_lower = user_text.lower()
-                if words and sum(1 for w in words if w in text_lower) >= max(1, len(words) // 2):
-                    article = str(item.get("article", ""))
-                    if article:
-                        order_context[chat_id]["article"] = article
-                        order_context[chat_id]["name"] = str(item.get("name", ""))
-                        break
+                # Считаем сколько слов из названия товара есть в тексте
+                words = [w for w in item_name.split() if len(w) > 1]
+                score = sum(1 for w in words if w in text_norm or w in user_text.lower())
+                if score > best_score:
+                    best_score = score
+                    best_article = str(item.get("article", ""))
+                    best_name = str(item.get("name", ""))
+
+            if best_score >= 1 and best_article:
+                article = best_article
+                order_context[chat_id]["article"] = article
+                order_context[chat_id]["name"] = best_name
 
         if article:
             photos = await get_product_photos(article)
+            print(f"[photo_send] article={article} photos={len(photos)}")
             if photos:
                 try:
                     from telegram import InputMediaPhoto
@@ -787,7 +806,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     return
                 except Exception as e:
                     print(f"[photo_send] error: {e}")
-            # Фото нет — агент сам ответит
+        else:
+            print(f"[photo_send] артикул не найден для: {user_text}")
     # ──────────────────────────────────────────────────────────
 
     # Сохраняем способ доставки если упоминается
