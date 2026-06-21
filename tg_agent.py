@@ -89,6 +89,20 @@ async def init_db():
                     UNIQUE(chat_id, article, size)
                 )
             """)
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS product_interest (
+                    id BIGSERIAL PRIMARY KEY,
+                    chat_id BIGINT NOT NULL,
+                    product_name TEXT NOT NULL,
+                    article VARCHAR(64) DEFAULT '',
+                    size VARCHAR(16) DEFAULT '',
+                    created_at TIMESTAMPTZ DEFAULT NOW()
+                )
+            """)
+            await conn.execute("""
+                CREATE INDEX IF NOT EXISTS idx_product_interest_date
+                ON product_interest(created_at DESC)
+            """)
         print("[db] Подключено, таблицы готовы")
     except Exception as e:
         print(f"[db] Ошибка подключения: {e}")
@@ -138,6 +152,87 @@ async def clear_history(chat_id: int):
             )
     except Exception as e:
         print(f"[db] clear_history error: {e}")
+
+
+async def track_product_interest(chat_id: int, product_name: str, article: str = "", size: str = "") -> None:
+    """Фиксируем интерес к товару."""
+    if not db_pool or not product_name:
+        return
+    try:
+        async with db_pool.acquire() as conn:
+            await conn.execute(
+                "INSERT INTO product_interest (chat_id, product_name, article, size) VALUES ($1, $2, $3, $4)",
+                chat_id, product_name, article, size
+            )
+    except Exception as e:
+        print(f"[interest] track error: {e}")
+
+
+async def build_tema_daily_report() -> str:
+    """Генерируем ежедневный отчёт Тёмы."""
+    if not db_pool:
+        return ""
+    try:
+        from datetime import timezone, timedelta
+        msk = timezone(timedelta(hours=3))
+        today = datetime.now(msk).date()
+
+        async with db_pool.acquire() as conn:
+            # Все диалоги за сегодня
+            all_chats = await conn.fetch("""
+                SELECT DISTINCT chat_id FROM tg_conversations
+                WHERE DATE(created_at AT TIME ZONE 'Europe/Moscow') = $1
+            """, today)
+
+            # Новые клиенты (первый раз пишут сегодня)
+            new_clients = await conn.fetch("""
+                SELECT COUNT(DISTINCT chat_id) as cnt FROM tg_conversations
+                WHERE DATE(created_at AT TIME ZONE 'Europe/Moscow') = $1
+                AND chat_id NOT IN (
+                    SELECT DISTINCT chat_id FROM tg_conversations
+                    WHERE DATE(created_at AT TIME ZONE 'Europe/Moscow') < $1
+                )
+            """, today)
+
+            # Интерес к товарам за сегодня
+            interests = await conn.fetch("""
+                SELECT product_name, size, COUNT(*) as cnt
+                FROM product_interest
+                WHERE DATE(created_at AT TIME ZONE 'Europe/Moscow') = $1
+                GROUP BY product_name, size
+                ORDER BY cnt DESC
+                LIMIT 15
+            """, today)
+
+        total = len(all_chats)
+        new_cnt = new_clients[0]["cnt"] if new_clients else 0
+        returning = total - new_cnt
+
+        # Строим текст отчёта
+        interest_lines = ""
+        if interests:
+            interest_lines = "\n".join([
+                f"— {r['product_name']}{' ' + r['size'] if r['size'] else ''} · {r['cnt']} {'раз' if r['cnt'] == 1 else 'раза' if 1 < r['cnt'] < 5 else 'раз'}"
+                for r in interests
+            ])
+        else:
+            interest_lines = "— данных нет"
+
+        timka_mention = "@tema22_38bot"  # Тимка отметка
+
+        report = (
+            f"📊 Отчёт Тёмы за {today.strftime('%d.%m.%Y')}\n\n"
+            f"💬 Диалогов всего: {total}\n"
+            f"🆕 Новых обращений: {new_cnt}\n"
+            f"🔄 Постоянных клиентов: {returning}\n\n"
+            f"📦 По каким товарам спрашивали:\n{interest_lines}\n\n"
+            f"{timka_mention} получи данные и зафиксируй!"
+        )
+        return report
+
+    except Exception as e:
+        print(f"[report] build error: {e}")
+        return ""
 
 
 # ── Фото товаров ───────────────────────────────────────────────
@@ -385,6 +480,50 @@ async def _parse_contacts_async(text: str) -> dict:
 
 
 def _update_order_context_sync(chat_id: int, text: str, inventory: list) -> None:
+    """Обновляем контекст заказа — определяем товар, размер, цену."""
+    ctx = order_context.setdefault(chat_id, {
+        "name": "", "size": "", "price": 0, "cost": 0, "article": "",
+        "recipient_name": "", "recipient_address": "", "recipient_phone": "",
+        "state": "idle"
+    })
+
+    text_lower = text.lower()
+    old_article = ctx.get("article", "")
+
+    for item in inventory:
+        name = str(item.get("name", "")).lower()
+        if not name:
+            continue
+        words = [w for w in name.split() if len(w) > 1]
+        if not words:
+            continue
+        matches = sum(1 for w in words if w in text_lower)
+        if matches >= max(1, len(words) // 2):
+            ctx["name"] = str(item.get("name", ""))
+            ctx["article"] = str(item.get("article", ""))
+            ctx["price"] = int(item.get("price", 0) or 0)
+            ctx["cost"] = int(item.get("cost", 0) or 0)
+            break
+
+    # Размер
+    size_map = {
+        "xxs": "XXS", "xs": "XS", "s": "S", "m": "M",
+        "l": "L", "xl": "XL", "xxl": "XXL", "2xl": "2XL", "3xl": "3XL"
+    }
+    for sz_key, sz_val in size_map.items():
+        if f" {sz_key} " in f" {text_lower} " or text_lower.endswith(f" {sz_key}") or text_lower.startswith(f"{sz_key} "):
+            ctx["size"] = sz_val
+            break
+
+    # Если появился новый товар — фиксируем интерес асинхронно
+    new_article = ctx.get("article", "")
+    if new_article and new_article != old_article:
+        asyncio.create_task(track_product_interest(
+            chat_id,
+            ctx.get("name", ""),
+            new_article,
+            ctx.get("size", "")
+        ))
     """Синхронная часть — товар, размер, цена. БЕЗ парсинга контактов."""
     if chat_id not in order_context:
         order_context[chat_id] = {
@@ -901,29 +1040,12 @@ async def check_receipt_photo(photo_bytes: bytes, expected_price: int) -> dict:
 
 
 async def check_low_stock_alert() -> None:
-    """Проверяем склад и алертим если товар заканчивается."""
-    try:
-        _, items = await get_inventory()
-        low = [i for i in items if int(i.get("stock", 99)) <= 2]
-        if not low:
-            return
-        lines = "\n".join([f"— {i['name']} ({i['size']}): {i['stock']} шт" for i in low])
-        owner_token = os.getenv("TELEGRAM_BOT_TOKEN")
-        async with httpx.AsyncClient(timeout=5) as http:
-            await http.post(
-                f"https://api.telegram.org/bot{owner_token}/sendMessage",
-                json={
-                    "chat_id": OWNER_CHAT_ID,
-                    "text": f"⚠️ Заканчиваются товары ({len(low)} позиций):\n{lines}\n\nВремя закупать!"
-                }
-            )
-        print(f"[stock_alert] отправлен алерт: {len(low)} товаров")
-    except Exception as e:
-        print(f"[stock_alert] error: {e}")
+    """ТОЛЬКО для ручного вызова через /stockcheck — Тимка делает это автоматически."""
+    pass  # Алерт склада — зона Тимки через n8n
 
 
 async def send_daily_unclosed_report() -> None:
-    """Ежедневный отчёт по незакрытым диалогам."""
+    """Отчёт по незакрытым диалогам — отправляем в HQ тему Тёма."""
     if not db_pool:
         return
     try:
@@ -940,37 +1062,31 @@ async def send_daily_unclosed_report() -> None:
                 ORDER BY last_msg DESC
             """, today)
 
-        if not rows:
-            return
-
-        # Фильтруем тех кто купил
-        open_dialogs = [
-            r for r in rows
-            if r["chat_id"] not in upsell_sent
-        ]
-
+        open_dialogs = [r for r in rows if r["chat_id"] not in upsell_sent]
         if not open_dialogs:
             return
 
         lines = "\n".join([
-            f"— chat_id: {r['chat_id']} · последнее: {r['last_msg'].strftime('%H:%M')}"
+            f"— id:{r['chat_id']} · {r['last_msg'].strftime('%H:%M')}"
             for r in open_dialogs[:10]
         ])
 
-        owner_token = os.getenv("TELEGRAM_BOT_TOKEN")
+        # Отправляем в HQ тему Тёма (thread 10)
+        client_token = os.getenv("CLIENT_BOT_TOKEN")
         async with httpx.AsyncClient(timeout=5) as http:
             await http.post(
-                f"https://api.telegram.org/bot{owner_token}/sendMessage",
+                f"https://api.telegram.org/bot{client_token}/sendMessage",
                 json={
-                    "chat_id": OWNER_CHAT_ID,
+                    "chat_id": HQ_CHAT_ID,
+                    "message_thread_id": HQ_TOPIC_TEMA,
                     "text": (
                         f"📊 Незакрытые диалоги за сегодня: {len(open_dialogs)}\n\n"
                         f"{lines}\n\n"
-                        f"Напиши им сам или ретаргетинг сделает это завтра автоматически."
+                        f"Ретаргетинг напишет им завтра автоматически."
                     )
                 }
             )
-        print(f"[daily_report] отправлен: {len(open_dialogs)} диалогов")
+        print(f"[daily_report] отправлен в HQ: {len(open_dialogs)} диалогов")
     except Exception as e:
         print(f"[daily_report] error: {e}")
 
@@ -1003,15 +1119,14 @@ async def notify_new_stock(bot) -> None:
 
 
 async def run_daily_tasks(bot) -> None:
-    """Ежедневные задачи в 21:00 МСК + мониторинг uptime."""
+    """Ежедневные задачи в 21:00 МСК — Тёма пишет отчёт в General HQ."""
     from datetime import timezone, timedelta
     msk = timezone(timedelta(hours=3))
 
-    # Мониторинг uptime каждые 30 минут
     async def _uptime_ping():
         while True:
             await asyncio.sleep(30 * 60)
-            print("[uptime] бот живой ✅")
+            print("[uptime] ✅ живой")
 
     asyncio.create_task(_uptime_ping())
 
@@ -1020,16 +1135,28 @@ async def run_daily_tasks(bot) -> None:
             now = datetime.now(msk)
             target = now.replace(hour=21, minute=0, second=0, microsecond=0)
             if target <= now:
-                from datetime import timedelta as td
-                target = target + td(days=1)
+                target = target + timedelta(days=1)
             wait = (target - now).total_seconds()
-            print(f"[daily] следующий запуск через {wait/3600:.1f}ч")
+            print(f"[daily] отчёт через {wait/3600:.1f}ч")
             await asyncio.sleep(wait)
 
-            await check_low_stock_alert()
-            await asyncio.sleep(5)
+            # Тёма генерирует отчёт
+            report = await build_tema_daily_report()
+            if report:
+                # Пишем в General (thread_id=None = General)
+                client_token = os.getenv("CLIENT_BOT_TOKEN")
+                async with httpx.AsyncClient(timeout=10) as http:
+                    await http.post(
+                        f"https://api.telegram.org/bot{client_token}/sendMessage",
+                        json={
+                            "chat_id": HQ_CHAT_ID,
+                            "text": report
+                        }
+                    )
+                print("[daily] отчёт отправлен в General HQ")
+
+            # Отчёт по незакрытым диалогам — в тему Тёма
             await send_daily_unclosed_report()
-            print("[daily] задачи выполнены")
 
         except asyncio.CancelledError:
             break
@@ -1039,73 +1166,60 @@ async def run_daily_tasks(bot) -> None:
 
 
 def build_system_prompt(inventory_text: str) -> str:
-    return f"""Ты — менеджер магазина одежды KROSHIDE. Твоя цель — чтобы каждый покупатель был счастлив и вернулся снова.
+    return f"""Ты — Тёма, менеджер по продажам магазина KROSHIDE. Твоя единственная задача — продавать и делать клиентов счастливыми.
 
 ТОВАРЫ В НАЛИЧИИ:
 {inventory_text}
 
 О ТОВАРАХ:
-Все товары — премиум качества. Есть с брендовыми принтами и базовые без принта — все одинаково высокого качества.
-Футболки: 100% хлопок, ткань пенье-компакт, оверсайз крой, принт DTF (держится вечно), плотная.
-Худи и свитшоты: 80% хлопок 20% полиэстер, ткань футер, плотные, принт везде одинакового качества.
+Все товары — премиум качества.
+Футболки: 100% хлопок, ткань пенье-компакт, оверсайз крой, принт DTF, плотная.
+Худи и свитшоты: 80% хлопок 20% полиэстер, ткань футер, плотные.
 Лонгсливы: качество как у футболок.
-Поло (короткий и длинный рукав): 100% хлопок, ткань пике, премиум качество.
+Поло: 100% хлопок, ткань пике, премиум качество.
 Размеры: от XXS до 3XL.
 Можем нанести принт на заказ — от 3 рабочих дней.
-Уход: стирка 30-40°С деликатный режим, сушить в расправленном виде, гладить изнаночную сторону, не отбеливать.
+Уход: стирка 30-40°С деликатный режим, гладить изнаночную сторону.
 
 ДОСТАВКА:
 Отправка в течение 3 дней после оплаты.
-Способы доставки:
-- Яндекс доставка
-- СДЭК
-- Почта России
-- Авито доставка
-- Курьер по Москве и МО — стоимость от 500 рублей. Если покупатель хочет курьера — попроси адрес и скажи что уточнишь точную стоимость
-- Самовывоз: Москва, ул. Кржижановского 23к2. Это пункт выдачи, не шоурум. Все заказы выдаются по заявкам. Возможна оплата при получении.
+Яндекс доставка, СДЭК, Почта России, Авито доставка.
+Курьер по Москве и МО от 500 рублей — спроси адрес для уточнения стоимости.
+Самовывоз: Москва, ул. Кржижановского 23к2. Пункт выдачи, не шоурум. По заявкам. Оплата при получении.
 
 ОПЛАТА:
-Перевод на Тинькофф: Артём А., карта 2200700986188158 или по номеру +79776810910.
-При самовывозе возможна оплата при получении.
-Либо через Авито при покупке там.
+Тинькофф: Артём А., карта 2200700986188158 или +79776810910.
+При самовывозе — оплата при получении.
 
 ВОЗВРАТ И ГАРАНТИЯ:
-Возврат в течение 14 дней.
-Гарантия на товары 12 месяцев.
-При проблемах писать сюда или менеджеру @KROSHIDEMANAGER.
+Возврат в течение 14 дней. Гарантия 12 месяцев.
+При проблемах — @KROSHIDEMANAGER.
 
 СТИЛЬ ОБЩЕНИЯ:
-- Твоё имя — Тёма, ты живой менеджер магазина KROSHIDE
-- Если спрашивают кто ты — честно говори что ты Тёма, менеджер магазина
-- Не говори что ты бот или ИИ, но и не отрицай активно — просто веди себя как человек
-- Всегда обращайся на Вы, уважительно и тепло
-- Пиши живо, как настоящий живой человек — не робот
-- Максимум ОДИН смайлик на всё сообщение
-- Никакого форматирования — никаких звёздочек, решёток, тире в начале строк
-- Отвечай коротко — 2-4 предложения максимум
-- Никогда не здоровайся повторно если уже поздоровался в этом диалоге
-- Используй "подскажите" вместо "расскажите"
-- Не называй цену первым — сначала узнай что нужно покупателю
-- Покупатель может хотеть несколько товаров — учитывай это
-- Никогда не занижай товар — все вещи премиум качества
+- Ты Тёма, живой менеджер. Не говори что ты бот.
+- Обращайся на Вы, тепло и уважительно.
+- Пиши живо, коротко — 2-4 предложения максимум.
+- Один смайлик на всё сообщение максимум.
+- Никакого форматирования — никаких звёздочек, решёток, тире в начале строк.
+- Не называй цену первым — сначала узнай что нужно.
+- Никогда не занижай товар — всё премиум качество.
 
 ПРАВИЛА ПО РАЗМЕРАМ:
-- Рекомендуй ОДИН конкретный размер который лучше всего подходит
-- Не предлагай два размера сразу
-- До 175 см — M, 175-185 см — L, выше 185 см — XL
-- Вес выше 90 кг — добавляй один размер вверх
+До 175 см — M, 175-185 см — L, выше 185 см — XL. Вес выше 90 кг — размер вверх.
+Рекомендуй ОДИН конкретный размер.
 
-ПРАВИЛА:
-1. При торге можешь снизить цену максимум на 10%
-2. Если покупатель грубит — вежливо но твёрдо отвечай
-3. При эскалации (возврат, конфликт) — напиши ЭСКАЛАЦИЯ: в начале ответа
-4. Если товара нет — честно скажи и предложи альтернативу
-5. СТРОГО: когда покупатель выбирает товар — сначала уточни способ доставки, затем напиши ТОЛЬКО "Подскажите пожалуйста Ваше полное ФИО для оформления заказа." — адрес и телефон система запросит сама
-6. СТРОГО ЗАПРЕЩЕНО писать ПОКУПКА: пока покупатель не написал что уже перевёл деньги (слова: перевёл, оплатил, перевео, скинул)
-7. После слова ПОКУПКА: — поблагодари, скажи что отправишь в течение 2 дней и дашь трек-номер
-8. СТРОГО: если покупатель просит фото — отвечай ТОЛЬКО "Сейчас пришлю фото!" и больше ничего. Система сама отправит фото автоматически. НИКОГДА не говори что не можешь отправить фото.
-9. Если у товара пометка ⚠️ ПОСЛЕДНИЙ — обязательно упомяни это: "последний размер", "остался один", "торопитесь". Создай ощущение срочности.
-10. CROSS-SELL: после того как покупатель выбрал товар — предложи ОДИН дополнительный товар другого типа: "Кстати, к этому часто берут [название] — хотите покажу?" Делай это один раз и ненавязчиво."""
+ПРАВИЛА ПРОДАЖ:
+1. При торге снижай цену максимум на 10%.
+2. При грубости — вежливо но твёрдо отвечай.
+3. При эскалации (возврат, конфликт, жалоба) — пиши ЭСКАЛАЦИЯ: в начале ответа.
+4. СТРОГО: когда покупатель готов купить — сначала уточни способ доставки, затем напиши ТОЛЬКО "Подскажите пожалуйста Ваше полное ФИО для оформления заказа."
+5. СТРОГО ЗАПРЕЩЕНО писать ПОКУПКА: пока покупатель не написал что перевёл деньги.
+6. После ПОКУПКА: — поблагодари, скажи что отправишь в течение 3 дней и дашь трек-номер.
+7. Если покупатель просит фото — отвечай ТОЛЬКО "Сейчас пришлю фото!" Система отправит автоматически.
+8. Если у товара пометка ⚠️ ПОСЛЕДНИЙ — создай срочность: "последний размер", "торопитесь".
+9. CROSS-SELL: после выбора товара предложи ОДИН дополнительный товар другого типа — ненавязчиво и один раз.
+10. ВАЖНО: если покупатель спрашивает товар или размер которого НЕТ в списке выше — НЕ говори сразу "нет в наличии". Напиши УТОЧНИТЬ: [товар] [размер] и продолжи разговор словами "Уточню наличие у коллег, секунду!"
+11. Твой фокус — продажи и довольные клиенты. Склад, отчёты, аналитика — не твоя зона."""
 
 
 # ── Хендлеры ───────────────────────────────────────────────────
@@ -1704,6 +1818,32 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         is_sale = _is_purchase(user_text) or reply.startswith("ПОКУПКА:")
 
+        # ── УТОЧНИТЬ: товар не в таблице — спрашиваем владельца ──
+        if reply.startswith("УТОЧНИТЬ:"):
+            item_query = reply.replace("УТОЧНИТЬ:", "").strip()
+            await update.message.reply_text("Уточню наличие у коллег, секунду! 😊")
+
+            # Пишем в HQ тему Тёма
+            client_token = os.getenv("CLIENT_BOT_TOKEN")
+            async with httpx.AsyncClient(timeout=5) as http:
+                await http.post(
+                    f"https://api.telegram.org/bot{client_token}/sendMessage",
+                    json={
+                        "chat_id": HQ_CHAT_ID,
+                        "message_thread_id": HQ_TOPIC_TEMA,
+                        "text": (
+                            f"❓ Уточнение по товару\n"
+                            f"Покупатель: {user_name} (id:{chat_id})\n"
+                            f"Запрос: {item_query}\n\n"
+                            f"Есть ли это в наличии?\n"
+                            f"Ответь: /confirm {chat_id} да [цена] или /confirm {chat_id} нет"
+                        )
+                    }
+                )
+            await save_message(chat_id, "user", f"{user_name}: {user_text}")
+            await save_message(chat_id, "assistant", "Уточнено у коллег")
+            return
+
         if reply.startswith("ЭСКАЛАЦИЯ:"):
             clean = reply.replace("ЭСКАЛАЦИЯ:", "").strip()
             await update.message.reply_text(clean)
@@ -1922,6 +2062,32 @@ async def handle_owner_commands(update: Update, context: ContextTypes.DEFAULT_TY
     elif text.startswith("/stockcheck"):
         await check_low_stock_alert()
 
+    # /confirm chat_id да/нет [цена] — ответ на уточнение наличия
+    elif text.startswith("/confirm"):
+        parts = text.split()
+        if len(parts) < 3:
+            await update.message.reply_text("Использование: /confirm 123456 да 2500 или /confirm 123456 нет")
+            return
+        try:
+            target_chat = int(parts[1])
+            answer = parts[2].lower()
+            from telegram import Bot
+            client_bot = Bot(token=os.getenv("CLIENT_BOT_TOKEN"))
+            if answer in ["да", "yes", "есть"]:
+                price = parts[3] if len(parts) > 3 else "уточним"
+                await client_bot.send_message(
+                    chat_id=target_chat,
+                    text=f"Уточнил — есть в наличии! Цена {price}₽. Оформляем? 😊"
+                )
+            else:
+                await client_bot.send_message(
+                    chat_id=target_chat,
+                    text="Уточнил у коллег — к сожалению этого размера сейчас нет. Могу предложить похожий вариант, показать? 😊"
+                )
+            await update.message.reply_text(f"✅ Ответ отправлен покупателю {target_chat}")
+        except Exception as e:
+            await update.message.reply_text(f"❌ Ошибка: {e}")
+
     # /wishlist — показать весь список ожидания
     elif text.startswith("/wishlist"):
         if not db_pool:
@@ -2072,6 +2238,7 @@ def main():
             owner_app.add_handler(CommandHandler("newstock", handle_owner_commands))
             owner_app.add_handler(CommandHandler("report", handle_owner_commands))
             owner_app.add_handler(CommandHandler("stockcheck", handle_owner_commands))
+            owner_app.add_handler(CommandHandler("confirm", handle_owner_commands))
             owner_app.add_handler(MessageHandler(filters.PHOTO, handle_owner_photo))
             owner_app.add_handler(MessageHandler(filters.TEXT & filters.REPLY, handle_owner_reply))
 
