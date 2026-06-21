@@ -32,14 +32,18 @@ async def get_inventory() -> tuple:
     global _inv_cache
     inv_text, items, ts = _inv_cache
     if inv_text and (datetime.now().timestamp() - ts) < 300:
+        print(f"[content] склад из кэша: {len(items)} товаров")
         return inv_text, items
 
     try:
+        print(f"[content] запрашиваю склад из n8n...")
         async with httpx.AsyncClient(timeout=10) as http:
             resp = await http.get(N8N_INVENTORY_URL)
             data = resp.json()
+            print(f"[content] склад получен: {len(data) if isinstance(data, list) else 'не список'} записей")
             if isinstance(data, list):
                 items = [i for i in data if int(i.get("stock", 0)) > 0]
+                print(f"[content] в наличии: {len(items)} товаров")
                 lines = [
                     f"- {i['name']} ({i['size']}): {i['price']}₽, остаток: {i['stock']} шт"
                     + (" ⚠️ ПОСЛЕДНИЙ" if int(i.get('stock', 99)) <= 2 else "")
@@ -47,6 +51,8 @@ async def get_inventory() -> tuple:
                 ]
                 inv_text = "\n".join(lines)
                 _inv_cache = (inv_text, items, datetime.now().timestamp())
+            else:
+                print(f"[content] склад вернул не список: {str(data)[:200]}")
     except Exception as e:
         print(f"[content] inventory error: {e}")
 
