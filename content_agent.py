@@ -63,16 +63,24 @@ async def get_inventory() -> tuple:
 
 
 async def get_photos(article: str) -> list:
-    """Берём фото товара из PostgreSQL через tg_agent."""
-    # Импортируем функцию из tg_agent если доступна
+    """Берём фото товара напрямую из PostgreSQL."""
+    import asyncpg
+    db_url = os.getenv("DATABASE_URL_ASYNCPG", os.getenv("DATABASE_URL", "").replace("postgresql+asyncpg://", "postgresql://"))
+    if not db_url:
+        return []
     try:
-        import sys
-        if 'tg_agent' in sys.modules:
-            from tg_agent import get_product_photos
-            return await get_product_photos(article)
-    except Exception:
-        pass
-    return []
+        cyrillic_to_latin = str.maketrans("АВСЕКМНОРТХавсекмнорТх", "ABCEKMHOPTXabcekmhoptx")
+        article_norm = article.strip().upper().translate(cyrillic_to_latin)
+        conn = await asyncpg.connect(db_url)
+        rows = await conn.fetch(
+            "SELECT file_id FROM product_photos WHERE UPPER(article) = $1 ORDER BY created_at ASC",
+            article_norm
+        )
+        await conn.close()
+        return [r["file_id"] for r in rows]
+    except Exception as e:
+        print(f"[content] get_photos error: {e}")
+        return []
 
 # ── Расписание ──────────────────────────────────────────────────
 
