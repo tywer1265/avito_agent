@@ -418,19 +418,12 @@ async def cmd_post(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 # ── Запуск ───────────────────────────────────────────────────────
 
 async def run():
-    app = Application.builder().token(CONTENT_BOT_TOKEN).build()
-    app.add_handler(CommandHandler("post", cmd_post))
-    app.add_handler(CallbackQueryHandler(handle_callback, pattern="^pub_"))
-
-    await app.initialize()
-    await app.start()
-    await app.updater.start_polling(drop_pending_updates=True)
-
-    print("[content] бот @irioqwqhdqdiw12332_bot запущен")
-
-    # Запускаем планировщик
-    asyncio.create_task(run_scheduler(app.bot))
-
+    """Просто запускаем планировщик — без polling."""
+    # Создаём бота только для отправки сообщений
+    from telegram import Bot
+    bot = Bot(token=CONTENT_BOT_TOKEN)
+    print("[content] бот @irioqwqhdqdiw12332_bot инициализирован")
+    asyncio.create_task(run_scheduler(bot))
     # Держим живым
     await asyncio.Event().wait()
 

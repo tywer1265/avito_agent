@@ -1784,6 +1784,14 @@ def main():
             owner_app.add_handler(MessageHandler(filters.PHOTO, handle_owner_photo))
             owner_app.add_handler(MessageHandler(filters.TEXT & filters.REPLY, handle_owner_reply))
 
+            # /post — через content_agent
+            try:
+                from content_agent import cmd_post as handle_post_cmd, handle_callback as handle_pub_callback
+                owner_app.add_handler(CommandHandler("post", handle_post_cmd))
+                owner_app.add_handler(CallbackQueryHandler(handle_pub_callback, pattern="^pub_"))
+            except Exception as e:
+                print(f"[owner] content_agent import error: {e}")
+
             await owner_app.initialize()
             await owner_app.start()
             await owner_app.updater.start_polling(drop_pending_updates=True)
