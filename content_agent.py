@@ -265,10 +265,32 @@ async def send_for_approval(bot, post: dict) -> None:
     ]])
 
     try:
+        photo_bytes = None
+
+        # Скачиваем фото через клиентский бот если есть file_id
         if post.get("photo_file_id"):
+            try:
+                client_token = os.getenv("CLIENT_BOT_TOKEN")
+                async with httpx.AsyncClient(timeout=15) as http:
+                    # Получаем ссылку на файл
+                    r = await http.get(
+                        f"https://api.telegram.org/bot{client_token}/getFile",
+                        params={"file_id": post["photo_file_id"]}
+                    )
+                    file_data = r.json()
+                    if file_data.get("ok"):
+                        file_path = file_data["result"]["file_path"]
+                        img_resp = await http.get(
+                            f"https://api.telegram.org/file/bot{client_token}/{file_path}"
+                        )
+                        photo_bytes = img_resp.content
+            except Exception as e:
+                print(f"[content] photo download error: {e}")
+
+        if photo_bytes:
             msg = await bot.send_photo(
                 chat_id=OWNER_CHAT_ID,
-                photo=post["photo_file_id"],
+                photo=photo_bytes,
                 caption=caption[:1024],
                 reply_markup=keyboard
             )
@@ -280,9 +302,11 @@ async def send_for_approval(bot, post: dict) -> None:
             )
 
         pending_posts[msg.message_id] = post
-        print(f"[content] пост на апруве: {post['type']} msg={msg.message_id}")
+        # Сохраняем байты фото для публикации
+        if photo_bytes:
+            pending_posts[msg.message_id]["photo_bytes"] = photo_bytes
 
-        # Автопубликация через 10 минут если нет ответа
+        print(f"[content] пост на апруве: {post['type']} msg={msg.message_id}")
         asyncio.create_task(_auto_publish(bot, msg.message_id, post))
 
     except Exception as e:
@@ -301,22 +325,18 @@ async def _auto_publish(bot, msg_id: int, post: dict) -> None:
 async def publish(post: dict) -> bool:
     try:
         async with httpx.AsyncClient(timeout=30) as http:
-            if post.get("photo_file_id"):
+            photo_bytes = post.get("photo_bytes")
+            if photo_bytes:
                 resp = await http.post(
                     f"https://api.telegram.org/bot{CONTENT_BOT_TOKEN}/sendPhoto",
-                    json={
-                        "chat_id": CHANNEL_ID,
-                        "photo": post["photo_file_id"],
-                        "caption": post["text"][:1024]
-                    }
+                    params={"chat_id": CHANNEL_ID},
+                    files={"photo": ("photo.jpg", photo_bytes, "image/jpeg")},
+                    data={"caption": post["text"][:1024]}
                 )
             else:
                 resp = await http.post(
                     f"https://api.telegram.org/bot{CONTENT_BOT_TOKEN}/sendMessage",
-                    json={
-                        "chat_id": CHANNEL_ID,
-                        "text": post["text"][:4096]
-                    }
+                    json={"chat_id": CHANNEL_ID, "text": post["text"][:4096]}
                 )
             data = resp.json()
             if data.get("ok"):
