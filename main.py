@@ -58,13 +58,8 @@ async def lifespan(app: FastAPI):
     scheduler.start()
     log.info("avito_agents.scheduler_started", jobs=len(scheduler.get_jobs()))
 
-    # 3. Notify owner
+    # 3. Notify owner — убрано, стартовое сообщение отправляет tg_agent.py
     await asyncio.sleep(2)  # wait for bot thread
-    await send_alert(
-        f"🚀 *Avito Agents запущены*\n"
-        f"Среда: `{settings.app_env}`\n"
-        f"Задач в планировщике: {len(scheduler.get_jobs())}"
-    )
 
     yield  # ← app runs here
 
@@ -236,3 +231,7 @@ def run_tg_bot():
     subprocess.run([sys.executable, "tg_agent.py"])
 
 threading.Thread(target=run_tg_bot, daemon=True).start()
+
+# Запускаем контент-агента
+from content_agent import start_content_agent
+start_content_agent()

@@ -254,6 +254,7 @@ async def delete_product_photos(article: str) -> int:
         return 0
 
 
+
 async def find_article_by_name(name_part: str, inventory_items: list) -> str:
     """Ищет артикул по части названия товара."""
     name_lower = name_part.lower()
@@ -966,6 +967,58 @@ HQ_TOPIC_ZAKAZY = 16
 HQ_TOPIC_ZADACHI = 2
 
 
+async def get_hq_context() -> dict:
+    """Собираем весь контекст для Тёмы в HQ — клиенты, диалоги, ретаргетинг, вишлист."""
+    ctx = {
+        "new_clients_today": 0,
+        "retargeting_active": 0,
+        "wishlist": [],
+        "open_dialogs": [],
+        "paused_clients": list(paused_chats.keys()),
+        "retargeting_clients": [],
+    }
+
+    if not db_pool:
+        return ctx
+
+    try:
+        async with db_pool.acquire() as conn:
+            # Новые клиенты сегодня
+            today = datetime.now().date()
+            rows = await conn.fetch(
+                "SELECT COUNT(DISTINCT chat_id) as cnt FROM tg_conversations WHERE DATE(created_at) = $1",
+                today
+            )
+            ctx["new_clients_today"] = rows[0]["cnt"] if rows else 0
+
+            # Незакрытые диалоги — клиенты которые писали но не купили
+            rows = await conn.fetch("""
+                SELECT DISTINCT chat_id, MAX(created_at) as last_msg
+                FROM tg_conversations
+                WHERE role = 'user' AND DATE(created_at) = $1
+                GROUP BY chat_id
+                ORDER BY last_msg DESC
+                LIMIT 20
+            """, today)
+            ctx["open_dialogs"] = [{"chat_id": r["chat_id"], "last_msg": str(r["last_msg"])} for r in rows]
+
+            # Вишлист
+            rows = await conn.fetch("""
+                SELECT user_name, product_name, size, chat_id, created_at
+                FROM wishlist ORDER BY created_at DESC
+            """)
+            ctx["wishlist"] = [{"name": r["user_name"], "product": r["product_name"], "size": r["size"], "chat_id": r["chat_id"]} for r in rows]
+
+    except Exception as e:
+        print(f"[hq_ctx] error: {e}")
+
+    # Ретаргетинг
+    ctx["retargeting_active"] = len(retargeting_tasks)
+    ctx["retargeting_clients"] = list(retargeting_tasks.keys())
+
+    return ctx
+
+
 async def handle_hq_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обработчик сообщений в KROSHIDE Online Office."""
     if update.effective_chat.id != HQ_CHAT_ID:
@@ -979,30 +1032,84 @@ async def handle_hq_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     print(f"[hq] thread_id={thread_id} text={text[:50]}")
 
-    # Тема "Тёма" — отвечает на всё
+    # ── Тема ТЁМА ─────────────────────────────────────────────
     if thread_id == HQ_TOPIC_TEMA:
         await context.bot.send_chat_action(chat_id=HQ_CHAT_ID, action="typing", message_thread_id=thread_id)
+
         inventory_text, inventory_items = await get_inventory()
+        hq_ctx = await get_hq_context()
+
+        # Команды без AI
+        text_lower = text.lower()
+
+        # Пауза клиента
+        if "пауза" in text_lower or "поставь на паузу" in text_lower:
+            parts = text.split()
+            for p in parts:
+                if p.isdigit():
+                    paused_chats[int(p)] = asyncio.get_event_loop().time()
+                    await context.bot.send_message(chat_id=HQ_CHAT_ID, text=f"⏸ Клиент {p} поставлен на паузу", message_thread_id=thread_id)
+                    return
+            await context.bot.send_message(chat_id=HQ_CHAT_ID, text="Укажи chat_id клиента. Пример: пауза 123456789", message_thread_id=thread_id)
+            return
+
+        # Снять с паузы
+        if "снять" in text_lower or "resume" in text_lower:
+            parts = text.split()
+            for p in parts:
+                if p.isdigit():
+                    cid = int(p)
+                    if cid in paused_chats:
+                        del paused_chats[cid]
+                    await context.bot.send_message(chat_id=HQ_CHAT_ID, text=f"▶️ Клиент {p} снят с паузы", message_thread_id=thread_id)
+                    return
+
+        # Запустить ретаргетинг вручную
+        if "ретаргетинг" in text_lower and ("запусти" in text_lower or "отправь" in text_lower):
+            parts = text.split()
+            for p in parts:
+                if p.isdigit():
+                    cid = int(p)
+                    ctx_data = order_context.get(cid, {})
+                    schedule_retargeting(context.bot, cid, ctx_data.get("name", ""), ctx_data.get("size", ""))
+                    await context.bot.send_message(chat_id=HQ_CHAT_ID, text=f"🎯 Ретаргетинг запущен для клиента {p}", message_thread_id=thread_id)
+                    return
+            # Запустить всем кто в ретаргетинге
+            await context.bot.send_message(chat_id=HQ_CHAT_ID, text=f"🎯 Активных ретаргетингов: {hq_ctx['retargeting_active']}\nChat ID: {hq_ctx['retargeting_clients']}", message_thread_id=thread_id)
+            return
+
+        # AI отвечает на всё остальное
+        wishlist_text = "\n".join([f"- {w['name']} ждёт {w['product']} размер {w['size']} (chat_id: {w['chat_id']})" for w in hq_ctx["wishlist"]]) or "Вишлист пуст"
+        dialogs_text = "\n".join([f"- chat_id: {d['chat_id']}, последнее сообщение: {d['last_msg']}" for d in hq_ctx["open_dialogs"]]) or "Нет диалогов сегодня"
+
         try:
             loop = asyncio.get_event_loop()
             def _call_tema():
                 return client.messages.create(
                     model="claude-haiku-4-5-20251001",
-                    max_tokens=600,
-                    system=f"""Ты — Тёма, AI менеджер магазина KROSHIDE.
-Ты в рабочем чате Online Office с владельцем Артёмом.
-Отвечай коротко и по делу. Это рабочий чат, не продажи.
+                    max_tokens=700,
+                    system=f"""Ты — Тёма, менеджер по продажам KROSHIDE. Рабочий чат с владельцем Артёмом.
+Отвечай коротко, чётко, с цифрами. Без воды.
 
 СКЛАД:
 {inventory_text}
 
-Что умеешь:
-- Остатки и наличие товаров
-- Статус вишлиста
-- Ответы на вопросы по работе магазина
-- Любые команды по складу и клиентам
+ДАННЫЕ ПО КЛИЕНТАМ:
+- Новых клиентов сегодня: {hq_ctx['new_clients_today']}
+- Активных ретаргетингов: {hq_ctx['retargeting_active']} чел
+- На паузе: {len(hq_ctx['paused_clients'])} чел
 
-Отвечай чётко, с цифрами. Без лишних слов.""",
+ВИШЛИСТ (ждут товар):
+{wishlist_text}
+
+ДИАЛОГИ СЕГОДНЯ:
+{dialogs_text}
+
+КОМАНДЫ которые ты умеешь:
+- "пауза [chat_id]" — поставить клиента на паузу
+- "снять [chat_id]" — снять с паузы
+- "ретаргетинг [chat_id]" — запустить вручную
+- Любой вопрос по складу, клиентам, продажам""",
                     messages=[{"role": "user", "content": text}]
                 )
             response = await loop.run_in_executor(None, _call_tema)
@@ -1016,7 +1123,7 @@ async def handle_hq_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             print(f"[hq] tema error: {e}")
             await context.bot.send_message(chat_id=HQ_CHAT_ID, text="❌ Ошибка, попробуй ещё раз", message_thread_id=thread_id)
 
-    # Тема "Заказы" — краткая инфа по заказам
+    # ── Тема ЗАКАЗЫ ───────────────────────────────────────────
     elif thread_id == HQ_TOPIC_ZAKAZY:
         await context.bot.send_chat_action(chat_id=HQ_CHAT_ID, action="typing", message_thread_id=thread_id)
         inventory_text, _ = await get_inventory()
@@ -1039,97 +1146,6 @@ async def handle_hq_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         except Exception as e:
             print(f"[hq] zakazy error: {e}")
-
-    # Убираем обращение из текста
-    clean_text = text
-    for t in TEMA_TRIGGERS:
-        clean_text = clean_text.lower().replace(t, "").strip()
-
-    # Берём thread_id из входящего — отвечаем в ту же тему
-    thread_id = update.message.message_thread_id
-
-    await context.bot.send_chat_action(
-        chat_id=HQ_CHAT_ID,
-        action="typing",
-        message_thread_id=thread_id
-    )
-
-    inventory_text, inventory_items = await get_inventory()
-
-    try:
-        loop = asyncio.get_event_loop()
-        def _call():
-            return client.messages.create(
-                model="claude-haiku-4-5-20251001",
-                max_tokens=600,
-                system=f"""Ты — Тёма, AI менеджер магазина KROSHIDE.
-Ты в рабочем групповом чате KROSHIDE Online Office вместе с владельцем Артёмом.
-Отвечай коротко и по делу. Это рабочий чат, не продажи.
-
-СКЛАД:
-{inventory_text}
-
-Что умеешь:
-- Остатки и наличие товаров
-- Статус вишлиста
-- Ответы на вопросы по работе магазина
-- Выполнение команд
-
-Отвечай чётко, с цифрами. Без лишних слов.""",
-                messages=[{"role": "user", "content": clean_text or text}]
-            )
-        response = await loop.run_in_executor(None, _call)
-        reply = response.content[0].text
-
-        await context.bot.send_message(
-            chat_id=HQ_CHAT_ID,
-            text=f"🤖 Тёма: {reply}",
-            message_thread_id=thread_id
-        )
-
-    except Exception as e:
-        print(f"[hq] tema error: {e}")
-        await context.bot.send_message(
-            chat_id=HQ_CHAT_ID,
-            text="❌ Тёма: ошибка, попробуй ещё раз",
-            message_thread_id=thread_id
-        )
-    """Клиент прислал голосовое — транскрибируем и обрабатываем как текст."""
-    chat_id = update.effective_chat.id
-    user_name = update.effective_user.first_name or "Покупатель"
-
-    if is_spam(chat_id):
-        await update.message.reply_text("Чуть помедленнее, отвечу на все вопросы по очереди 😊")
-        return
-
-    await context.bot.send_chat_action(chat_id=chat_id, action="typing")
-
-    try:
-        voice = update.message.voice
-        file = await context.bot.get_file(voice.file_id)
-        voice_bytes = await file.download_as_bytearray()
-
-        # Пробуем транскрибировать
-        transcribed = await transcribe_voice(bytes(voice_bytes))
-
-        if not transcribed or len(transcribed) < 3:
-            await update.message.reply_text(
-                "Не смог распознать голосовое 😊 Напишите текстом — отвечу быстро!"
-            )
-            return
-
-        # Отправляем транскрипцию пользователю
-        await update.message.reply_text(f"🎤 Вы сказали: {transcribed}")
-
-        # Обрабатываем как обычное текстовое сообщение
-        update.message.text = transcribed
-        await handle_message(update, context)
-
-    except Exception as e:
-        print(f"[voice] error: {e}")
-        await update.message.reply_text(
-            "Не смог обработать голосовое. Напишите текстом — отвечу быстро! 😊"
-        )
 
 
 async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1767,6 +1783,7 @@ def main():
             owner_app.add_handler(CommandHandler("wishlist", handle_owner_commands))
             owner_app.add_handler(MessageHandler(filters.PHOTO, handle_owner_photo))
             owner_app.add_handler(MessageHandler(filters.TEXT & filters.REPLY, handle_owner_reply))
+
             await owner_app.initialize()
             await owner_app.start()
             await owner_app.updater.start_polling(drop_pending_updates=True)
