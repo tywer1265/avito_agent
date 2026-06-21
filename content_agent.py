@@ -89,126 +89,198 @@ def get_daily_schedule() -> list:
     windows = [10, 13, 16, 19, 21]
     random.shuffle(windows)
 
-    types = ["drop", "drop", "outfit", "sold", "brand_fact"]
+    # Пул типов — с весами
+    pool = [
+        "drop", "drop", "drop",        # дропы чаще
+        "stock", "stock",               # товары со склада
+        "outfit",                       # образ
+        "hype",                         # хайп
+        "urgency",                      # срочность
+        "price_comparison",             # сравнение цен
+        "sold",                         # продажа
+        "brand_fact",                   # факт
+        "lifestyle",                    # лайфстайл
+        "social_proof",                 # соцдоказательство
+    ]
 
-    # Анекдот раз в 3 дня
+    # Анекдот раз в 3 дня, вопрос раз в 5 дней
     day = datetime.now().timetuple().tm_yday
     if day % 3 == 0:
-        replace_idx = random.randint(2, 4)
-        types[replace_idx] = "joke"
+        pool.append("joke")
+    if day % 5 == 0:
+        pool.append("question")
+    if day % 7 == 0:
+        pool.append("behind_scenes")
 
+    types = random.sample(pool, min(5, len(pool)))
     random.shuffle(types)
 
-    # Добавляем рандомные минуты
-    schedule = [(h, random.randint(0, 59), t) for h, t in zip(windows, types)]
+    schedule = [(h, random.randint(5, 55), t) for h, t in zip(windows, types)]
     return sorted(schedule, key=lambda x: x[0])
 
 # ── Генерация постов ────────────────────────────────────────────
 
 async def generate_post(post_type: str, article: str = "") -> dict:
     inv_text, items = await get_inventory()
-    if not items:
+    if not items and post_type != "random":
         return {}
 
     # Выбираем товар
-    if article:
-        item = next((i for i in items if str(i.get("article", "")).upper() == article.upper()), None)
-        if not item:
-            item = random.choice(items)
-    else:
-        item = random.choice(items)
+    available = items
+    item = None
+    if post_type in ["stock"] or article:
+        if article:
+            item = next((i for i in available if str(i.get("article","")).upper() == article.upper()), None)
+        if not item and available:
+            item = random.choice(available)
+    elif available:
+        item = random.choice(available)
 
-    is_last = int(item.get("stock", 99)) <= 2
-    photos = await get_photos(str(item.get("article", "")))
+    is_last = int(item.get("stock", 99)) <= 2 if item else False
+    photos = await get_photos(str(item.get("article", ""))) if item else []
+
+    # Для random — выбираем случайный тип из всего арсенала
+    ALL_TYPES = [
+        "drop", "drop", "drop",           # дропы чаще всего
+        "outfit", "outfit",                # образы
+        "sold",                            # продажи
+        "brand_fact",                      # факты
+        "hype",                            # хайп пост
+        "price_comparison",                # сравнение цен
+        "lifestyle",                       # лайфстайл
+        "urgency",                         # срочность
+        "social_proof",                    # соцдоказательство
+        "joke",                            # анекдот
+        "behind_scenes",                   # за кулисами
+        "question",                        # вопрос аудитории
+    ]
+
+    if post_type == "random":
+        post_type = random.choice(ALL_TYPES)
+    elif post_type == "stock":
+        post_type = random.choice(["drop", "drop", "outfit", "sold", "urgency"])
+
+    item_name = item.get('name', '') if item else ''
+    item_size = item.get('size', '') if item else ''
+    item_price = item.get('price', '') if item else ''
+    brand = item_name.split()[0] if item_name else 'KROSHIDE'
+
+    MASTER_SYSTEM = f"""Ты — лучший SMM-специалист в мире по streetwear.
+Ты создаёшь контент для TG канала магазина KROSHIDE.
+Мы продаём премиум реплики Bape, CDG, Y3, Гоша Рубчинский, Mastermind.
+
+ПРАВИЛА:
+- Пиши живо, дерзко, по-молодёжному. Никакого официоза.
+- Цепляй с первой строки. Первые 2 слова решают всё.
+- Используй психологию продаж: дефицит, срочность, социальное доказательство, FOMO.
+- Хэштеги всегда в конце, 5-8 штук. Без пробела между # и словом.
+- Ссылка на менеджера всегда: {CHANNEL_USERNAME}
+- Максимум 8 строк текста без хэштегов.
+- Никогда не используй слово "реплика" открыто в тексте.
+- Пиши только текст поста. Ноль пояснений."""
 
     prompts = {
-        "drop": f"""Напиши пост-дроп для TG канала магазина KROSHIDE.
 
-Товар: {item.get('name')}
-Размер: {item.get('size')}
-Цена: {item.get('price')}₽
-{"Остался последний!" if is_last else ""}
+        "drop": f"""Напиши убойный пост-дроп.
+Товар: {item_name} · Размер {item_size} · {item_price}₽{"· ПОСЛЕДНИЙ" if is_last else ""}
 
-Формат (строго):
-🔥 ДРОП — KROSHIDE
+Варианты открытия (выбери один или придумай лучше):
+- "🔥 ДРОП — KROSHIDE"
+- "Это улетит сегодня 👀"
+- "Пришло. Берёшь?"
+- "Не успеешь — пожалеешь"
 
-{item.get('name')}
-Размер {item.get('size')}{"· Остался последний" if is_last else ""}
+Описание: качество, материал, почему это must-have. 2-3 строки.
+Цена и доставка: {item_price}₽ · По всему миру
+Контакт: {CHANNEL_USERNAME}
+Хэштеги про {brand} и streetwear.""",
 
-[2-3 строки про качество и стиль. Дерзко, коротко, без воды.]
+        "outfit": f"""Напиши пост "образ дня".
+Основа: {item_name} · {item_price}₽
+Склад для подбора: {inv_text[:600]}
 
-{item.get('price')} ₽ · Отправка по всему миру
+Подбери 2-3 вещи которые реально сочетаются. Опиши образ как стилист.
+Покажи итоговую цену за всё.
+Контакт: {CHANNEL_USERNAME}""",
 
-Забрать → {CHANNEL_USERNAME}
+        "sold": f"""Напиши пост "только что ушло".
+Товар: {item_name} · {item_size}
 
-#[5-7 хэштегов]
+Варианты:
+- "✅ УЛЕТЕЛО"
+- "Не успел? Жаль."
+- "Ещё один счастливчик"
 
-Только текст поста без пояснений.""",
+Создай ощущение что товар популярный и его быстро разбирают.
+Намекни что похожее ещё есть. {CHANNEL_USERNAME}""",
 
-        "outfit": f"""Напиши пост "образ дня" для TG канала KROSHIDE.
-Основа образа: {item.get('name')} — {item.get('price')}₽
+        "brand_fact": f"""Напиши пост "факт о бренде {brand}".
+Наш товар: {item_name} · {item_price}₽
 
-Склад (подбери 1-2 дополнительные вещи):
-{inv_text[:800]}
+Найди реально интересный малоизвестный факт про {brand}.
+Должно быть "вау, не знал". Не банальщина.
+Свяжи с нашим товаром в конце. {CHANNEL_USERNAME}""",
 
-Формат:
-🖤 ОБРАЗ ДНЯ — KROSHIDE
+        "hype": f"""Напиши хайп-пост про {brand} без прямой продажи.
+Товар в наличии: {item_name} · {item_price}₽
 
-[товар 1] + [товар 2] + [товар 3]
-[итоговая цена] ₽
+Создай ажиотаж вокруг бренда. Почему все его хотят.
+Кто его носит (знаменитости, субкультуры). Почему это статус.
+В конце мягко подведи к нашему каналу. {CHANNEL_USERNAME}""",
 
-[1-2 строки про стиль образа]
+        "price_comparison": f"""Напиши пост "наша цена vs оригинал".
+Товар: {item_name} · Наша цена: {item_price}₽
 
-Собрать образ → {CHANNEL_USERNAME}
+Найди реальную цену оригинала {brand} в интернете (обычно в 8-15 раз дороже).
+Покажи разницу наглядно. Задай риторический вопрос.
+Без слова "реплика". {CHANNEL_USERNAME}""",
 
-#streetwear #kroshide #outfit [ещё 3-4 хэштега]
+        "lifestyle": f"""Напиши лайфстайл пост про streetwear культуру.
+Связь с товаром: {item_name}
 
-Только текст поста.""",
+Про стиль жизни, самовыражение, почему streetwear это больше чем одежда.
+Философски, но коротко. Цепляй эмоцию. {CHANNEL_USERNAME}""",
 
-        "sold": f"""Напиши пост "только что продали" для TG канала KROSHIDE.
-Товар: {item.get('name')}, размер {item.get('size')}
+        "urgency": f"""Напиши пост с максимальной срочностью.
+Товар: {item_name} · {item_size} · {item_price}₽{"· ОСТАЛСЯ ПОСЛЕДНИЙ" if is_last else " · заканчивается"}
 
-Формат:
-✅ ТОЛЬКО ЧТО УЛЕТЕЛ
+Создай максимальный FOMO. Таймер в голове у читателя.
+Дефицит, уникальность, сейчас или никогда.
+{CHANNEL_USERNAME}""",
 
-{item.get('name')} · {item.get('size')}
-[короткая фраза про популярность или остаток]
+        "social_proof": f"""Напиши пост с социальным доказательством.
+Товар: {item_name}
 
-Успей → {CHANNEL_USERNAME}
+Покупают уже N-й человек на этой неделе (придумай реалистичную цифру).
+Скрин отзыва (придумай реалистичный отзыв покупателя).
+Почему люди возвращаются. {CHANNEL_USERNAME}""",
 
-#kroshide #streetwear [2-3 хэштега]
-
-Только текст поста.""",
-
-        "brand_fact": f"""Напиши пост "интересный факт" для TG канала KROSHIDE.
-Бренд: {item.get('name', '').split()[0] if item.get('name') else 'Bape'}
-Наш товар: {item.get('name')} — {item.get('price')}₽
-
-Формат:
-🧠 А ТЫ ЗНАЛ?
-
-[реальный интересный исторический факт про этот бренд. 2-3 предложения.]
-
-[название нашего товара] — {item.get('price')} ₽
-{CHANNEL_USERNAME}
-
-#[бренд] #streetwear #kroshide #факт
-
-Только текст поста.""",
-
-        "joke": f"""Найди очень смешной короткий анекдот. Реально смешной, не банальный, желательно про моду или деньги.
+        "joke": """Найди самый смешной анекдот про моду, деньги или стиль.
+Реально смешной, не баян.
 
 Формат:
 😂 Анекдот дня
 
-[анекдот 3-5 строк]
+[анекдот]
 
 А одежда по хорошим ценам — только у нас 😏
-{CHANNEL_USERNAME}
+@kroshidemanager
 
-#юмор #анекдот #kroshide
+#юмор #мода #kroshide""",
 
-Только текст поста."""
+        "behind_scenes": f"""Напиши пост "за кулисами" магазина.
+Товар который готовим: {item_name}
+
+Покажи процесс: отбор товара, проверка качества, упаковка.
+Дай ощущение что за магазином стоят люди которые реально разбираются.
+Создай доверие. {CHANNEL_USERNAME}""",
+
+        "question": f"""Напиши интерактивный пост-вопрос для вовлечения аудитории.
+Связь с товаром: {item_name} · {brand}
+
+Задай цепляющий вопрос про стиль, моду или streetwear.
+Попроси ответить в комментариях или реакцией.
+В конце упомяни что у нас есть крутые вещи. {CHANNEL_USERNAME}""",
     }
 
     try:
@@ -217,8 +289,9 @@ async def generate_post(post_type: str, article: str = "") -> dict:
 
         def _call():
             return client.messages.create(
-                model="claude-haiku-4-5-20251001",
-                max_tokens=500,
+                model="claude-sonnet-4-6",  # Sonnet для лучшего качества постов
+                max_tokens=600,
+                system=MASTER_SYSTEM,
                 messages=[{"role": "user", "content": prompt}]
             )
 
@@ -229,8 +302,8 @@ async def generate_post(post_type: str, article: str = "") -> dict:
             "type": post_type,
             "text": text,
             "photo_file_id": photos[0] if photos else None,
-            "article": str(item.get("article", "")),
-            "item_name": str(item.get("name", ""))
+            "article": str(item.get("article", "")) if item else "",
+            "item_name": item_name
         }
 
     except Exception as e:
@@ -428,28 +501,54 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
 
 async def cmd_post(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """/post [тип] [артикул] — сгенерировать пост вручную."""
+    """/post random | /post stock | /post [тип] | /post [артикул]"""
     if update.effective_user.id != OWNER_CHAT_ID:
         return
 
+    args = context.args or []
+    arg = args[0].lower() if args else "random"
+
     type_map = {
+        "random": "random",
+        "stock": "stock",
         "дроп": "drop", "drop": "drop",
         "образ": "outfit", "outfit": "outfit",
         "анекдот": "joke", "joke": "joke",
         "факт": "brand_fact",
-        "продажа": "sold", "sold": "sold"
+        "продажа": "sold", "sold": "sold",
+        "хайп": "hype", "hype": "hype",
+        "цена": "price_comparison",
+        "лайф": "lifestyle",
+        "срочно": "urgency",
+        "отзыв": "social_proof",
+        "кулисы": "behind_scenes",
+        "вопрос": "question",
     }
 
-    args = context.args or []
-    post_type = type_map.get(args[0].lower(), "drop") if args else "drop"
-    article = args[1] if len(args) > 1 else (args[0] if args and args[0].upper() == args[0] else "")
+    post_type = type_map.get(arg, "random")
+    # Если передали артикул (заглавные буквы или цифры) — делаем дроп по артикулу
+    article = args[0] if args and args[0].upper() == args[0] and arg not in type_map else ""
+    if article:
+        post_type = "stock"
 
-    await update.message.reply_text(f"🎨 Генерирую {post_type}...")
+    labels = {
+        "random": "🎲 Рандом",
+        "stock": "📦 Товар со склада",
+        "drop": "🔥 Дроп", "outfit": "🖤 Образ",
+        "sold": "✅ Продажа", "brand_fact": "🧠 Факт",
+        "hype": "💥 Хайп", "price_comparison": "💰 Сравнение цен",
+        "lifestyle": "🌊 Лайфстайл", "urgency": "⏰ Срочность",
+        "social_proof": "👥 Соцдоказательство",
+        "joke": "😂 Анекдот", "behind_scenes": "🎬 За кулисами",
+        "question": "❓ Вопрос"
+    }
+
+    await update.message.reply_text(f"🎨 Генерирую: {labels.get(post_type, post_type)}...")
     post = await generate_post(post_type, article)
     if post:
         await send_for_approval(context.bot, post)
     else:
-        await update.message.reply_text("❌ Не смог сгенерировать пост")
+        await update.message.reply_text("❌ Не смог сгенерировать пост. Проверь склад.")
 
 
 # ── Запуск ───────────────────────────────────────────────────────
