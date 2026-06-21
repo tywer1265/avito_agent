@@ -820,7 +820,222 @@ async def notify_sale(user_name: str, chat_id: int) -> dict:
             await http.post(N8N_ORDERS_URL, json=payload)
     except Exception as e:
         print(f"[sale] webhook error: {e}")
+
+    # Запускаем запрос отзыва через 7 дней
+    asyncio.create_task(_request_review_after_7days(chat_id, user_name, ctx.get("name", "")))
+
     return payload
+
+
+async def _request_review_after_7days(chat_id: int, user_name: str, product_name: str) -> None:
+    """Через 7 дней просим отзыв."""
+    await asyncio.sleep(7 * 24 * 60 * 60)
+    try:
+        msg = (
+            f"Привет! Хотели уточнить — всё пришло в порядке? 😊\n"
+            f"Как вам {product_name}? Будем очень рады отзыву — это важно для нас!"
+        )
+        from telegram import Bot
+        bot = Bot(token=os.getenv("CLIENT_BOT_TOKEN"))
+        await bot.send_message(chat_id=chat_id, text=msg)
+        print(f"[review] запрос отзыва отправлен: {chat_id}")
+    except Exception as e:
+        print(f"[review] error: {e}")
+
+
+async def _inactive_client_reminder(bot, chat_id: int, product_name: str) -> None:
+    """Через 30 дней пишем клиенту с новинками."""
+    await asyncio.sleep(30 * 24 * 60 * 60)
+    try:
+        inv_text, items = await get_inventory()
+        if not items:
+            return
+        # Берём 2-3 новых товара
+        picks = items[:3] if len(items) >= 3 else items
+        picks_text = "\n".join([f"— {i['name']} ({i['size']}) · {i['price']}₽" for i in picks])
+        msg = (
+            f"Давно не виделись! 😊 У нас появились новинки — посмотрите:\n\n"
+            f"{picks_text}\n\n"
+            f"Пишите если что-то понравится!"
+        )
+        await bot.send_message(chat_id=chat_id, text=msg)
+        print(f"[inactive] напоминание отправлено: {chat_id}")
+    except Exception as e:
+        print(f"[inactive] error: {e}")
+
+
+async def check_receipt_photo(photo_bytes: bytes, expected_price: int) -> dict:
+    """Claude Vision проверяет чек оплаты."""
+    try:
+        image_b64 = base64.standard_b64encode(photo_bytes).decode()
+        loop = asyncio.get_event_loop()
+
+        def _call():
+            return client.messages.create(
+                model="claude-haiku-4-5-20251001",
+                max_tokens=200,
+                messages=[{"role": "user", "content": [
+                    {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": image_b64}},
+                    {"type": "text", "text": f"""Это чек оплаты. Проверь:
+1. Это банковский перевод или квитанция? (да/нет)
+2. Какая сумма на чеке? (число)
+3. Есть ли реквизиты: 2200700986188158 или +79776810910 или Артём? (да/нет/не видно)
+4. Статус операции — успешно? (да/нет/не видно)
+
+Ожидаемая сумма: {expected_price}₽
+Ответь строго в формате JSON: {{"is_receipt": true/false, "amount": 0, "has_requisites": true/false, "is_success": true/false, "verdict": "ok/suspicious/not_receipt"}}"""}
+                ]}]
+            )
+
+        response = await loop.run_in_executor(None, _call)
+        text = response.content[0].text.strip()
+        # Парсим JSON
+        import json as json_mod
+        start = text.find("{")
+        end = text.rfind("}") + 1
+        if start != -1 and end > start:
+            return json_mod.loads(text[start:end])
+    except Exception as e:
+        print(f"[receipt] check error: {e}")
+    return {"verdict": "error"}
+
+
+async def check_low_stock_alert() -> None:
+    """Проверяем склад и алертим если товар заканчивается."""
+    try:
+        _, items = await get_inventory()
+        low = [i for i in items if int(i.get("stock", 99)) <= 2]
+        if not low:
+            return
+        lines = "\n".join([f"— {i['name']} ({i['size']}): {i['stock']} шт" for i in low])
+        owner_token = os.getenv("TELEGRAM_BOT_TOKEN")
+        async with httpx.AsyncClient(timeout=5) as http:
+            await http.post(
+                f"https://api.telegram.org/bot{owner_token}/sendMessage",
+                json={
+                    "chat_id": OWNER_CHAT_ID,
+                    "text": f"⚠️ Заканчиваются товары ({len(low)} позиций):\n{lines}\n\nВремя закупать!"
+                }
+            )
+        print(f"[stock_alert] отправлен алерт: {len(low)} товаров")
+    except Exception as e:
+        print(f"[stock_alert] error: {e}")
+
+
+async def send_daily_unclosed_report() -> None:
+    """Ежедневный отчёт по незакрытым диалогам."""
+    if not db_pool:
+        return
+    try:
+        from datetime import timezone, timedelta
+        msk = timezone(timedelta(hours=3))
+        today = datetime.now(msk).date()
+
+        async with db_pool.acquire() as conn:
+            rows = await conn.fetch("""
+                SELECT DISTINCT chat_id, MAX(created_at) as last_msg
+                FROM tg_conversations
+                WHERE role = 'user' AND DATE(created_at) = $1
+                GROUP BY chat_id
+                ORDER BY last_msg DESC
+            """, today)
+
+        if not rows:
+            return
+
+        # Фильтруем тех кто купил
+        open_dialogs = [
+            r for r in rows
+            if r["chat_id"] not in upsell_sent
+        ]
+
+        if not open_dialogs:
+            return
+
+        lines = "\n".join([
+            f"— chat_id: {r['chat_id']} · последнее: {r['last_msg'].strftime('%H:%M')}"
+            for r in open_dialogs[:10]
+        ])
+
+        owner_token = os.getenv("TELEGRAM_BOT_TOKEN")
+        async with httpx.AsyncClient(timeout=5) as http:
+            await http.post(
+                f"https://api.telegram.org/bot{owner_token}/sendMessage",
+                json={
+                    "chat_id": OWNER_CHAT_ID,
+                    "text": (
+                        f"📊 Незакрытые диалоги за сегодня: {len(open_dialogs)}\n\n"
+                        f"{lines}\n\n"
+                        f"Напиши им сам или ретаргетинг сделает это завтра автоматически."
+                    )
+                }
+            )
+        print(f"[daily_report] отправлен: {len(open_dialogs)} диалогов")
+    except Exception as e:
+        print(f"[daily_report] error: {e}")
+
+
+async def notify_new_stock(bot) -> None:
+    """Уведомляем всю базу клиентов о новой партии."""
+    if not db_pool:
+        return
+    try:
+        async with db_pool.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT DISTINCT chat_id FROM tg_conversations ORDER BY chat_id"
+            )
+        _, items = await get_inventory()
+        new_items = items[:5] if items else []
+        picks = "\n".join([f"— {i['name']} ({i['size']}) · {i['price']}₽" for i in new_items])
+
+        msg = f"Привет! Пришла новая партия 🔥\n\n{picks}\n\nПишите если интересует!"
+        count = 0
+        for row in rows:
+            try:
+                await bot.send_message(chat_id=row["chat_id"], text=msg)
+                count += 1
+                await asyncio.sleep(0.1)  # антиспам
+            except Exception:
+                pass
+        print(f"[new_stock] уведомлено: {count} клиентов")
+    except Exception as e:
+        print(f"[new_stock] error: {e}")
+
+
+async def run_daily_tasks(bot) -> None:
+    """Ежедневные задачи в 21:00 МСК + мониторинг uptime."""
+    from datetime import timezone, timedelta
+    msk = timezone(timedelta(hours=3))
+
+    # Мониторинг uptime каждые 30 минут
+    async def _uptime_ping():
+        while True:
+            await asyncio.sleep(30 * 60)
+            print("[uptime] бот живой ✅")
+
+    asyncio.create_task(_uptime_ping())
+
+    while True:
+        try:
+            now = datetime.now(msk)
+            target = now.replace(hour=21, minute=0, second=0, microsecond=0)
+            if target <= now:
+                from datetime import timedelta as td
+                target = target + td(days=1)
+            wait = (target - now).total_seconds()
+            print(f"[daily] следующий запуск через {wait/3600:.1f}ч")
+            await asyncio.sleep(wait)
+
+            await check_low_stock_alert()
+            await asyncio.sleep(5)
+            await send_daily_unclosed_report()
+            print("[daily] задачи выполнены")
+
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            print(f"[daily] error: {e}")
+            await asyncio.sleep(3600)
 
 
 def build_system_prompt(inventory_text: str) -> str:
@@ -889,7 +1104,8 @@ def build_system_prompt(inventory_text: str) -> str:
 6. СТРОГО ЗАПРЕЩЕНО писать ПОКУПКА: пока покупатель не написал что уже перевёл деньги (слова: перевёл, оплатил, перевео, скинул)
 7. После слова ПОКУПКА: — поблагодари, скажи что отправишь в течение 2 дней и дашь трек-номер
 8. СТРОГО: если покупатель просит фото — отвечай ТОЛЬКО "Сейчас пришлю фото!" и больше ничего. Система сама отправит фото автоматически. НИКОГДА не говори что не можешь отправить фото.
-9. Если у товара пометка ⚠️ ПОСЛЕДНИЙ — обязательно упомяни это: "последний размер", "остался один", "торопитесь". Создай ощущение срочности."""
+9. Если у товара пометка ⚠️ ПОСЛЕДНИЙ — обязательно упомяни это: "последний размер", "остался один", "торопитесь". Создай ощущение срочности.
+10. CROSS-SELL: после того как покупатель выбрал товар — предложи ОДИН дополнительный товар другого типа: "Кстати, к этому часто берут [название] — хотите покажу?" Делай это один раз и ненавязчиво."""
 
 
 # ── Хендлеры ───────────────────────────────────────────────────
@@ -1170,9 +1386,67 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         file = await context.bot.get_file(photo.file_id)
         photo_bytes = await file.download_as_bytearray()
 
+        # Проверяем — это чек оплаты?
+        ctx = order_context.get(chat_id, {})
+        state = ctx.get("state", "idle")
+        expected_price = ctx.get("price", 0)
+
+        if state == "waiting_confirm" or expected_price:
+            result = await check_receipt_photo(bytes(photo_bytes), expected_price)
+            verdict = result.get("verdict", "error")
+
+            if verdict == "ok":
+                await update.message.reply_text(
+                    "Спасибо за заказ! Передал его на сборку, отправка будет в течение 3х дней, ожидайте. Трек номер пришлю чуть позже! ♥️"
+                )
+                cancel_retargeting(chat_id)
+                order = await notify_sale(user_name, chat_id)
+                if chat_id not in upsell_sent:
+                    inventory_text, inventory_items = await get_inventory()
+                    asyncio.create_task(send_upsell(context.bot, chat_id, ctx.get("article", ""), inventory_items))
+                # Алерт владельцу
+                amount = result.get("amount", "?")
+                owner_token = os.getenv("TELEGRAM_BOT_TOKEN")
+                async with httpx.AsyncClient(timeout=5) as http:
+                    await http.post(
+                        f"https://api.telegram.org/bot{owner_token}/sendMessage",
+                        json={
+                            "chat_id": OWNER_CHAT_ID,
+                            "text": (
+                                f"✅ ЧЕК ПОДТВЕРЖДЁН автоматически\n"
+                                f"Покупатель: {user_name} (id:{chat_id})\n"
+                                f"Товар: {ctx.get('name', '?')}\n"
+                                f"Сумма на чеке: {amount}₽\n"
+                                f"Ожидалось: {expected_price}₽"
+                            )
+                        }
+                    )
+                return
+
+            elif verdict == "suspicious":
+                owner_token = os.getenv("TELEGRAM_BOT_TOKEN")
+                async with httpx.AsyncClient(timeout=5) as http:
+                    await http.post(
+                        f"https://api.telegram.org/bot{owner_token}/sendMessage",
+                        json={
+                            "chat_id": OWNER_CHAT_ID,
+                            "text": (
+                                f"⚠️ ПОДОЗРИТЕЛЬНЫЙ ЧЕК\n"
+                                f"Покупатель: {user_name} (id:{chat_id})\n"
+                                f"Товар: {ctx.get('name', '?')}\n"
+                                f"Сумма: {result.get('amount', '?')}₽ (ожидалось {expected_price}₽)\n"
+                                f"Проверь вручную!"
+                            )
+                        }
+                    )
+                await update.message.reply_text(
+                    "Получил чек, передаю менеджеру на проверку. Как только подтвердим — сразу напишу! 😊"
+                )
+                return
+
+        # Если не чек — анализируем как фото товара
         inventory_text, inventory_items = await get_inventory()
         reply = await analyze_photo(bytes(photo_bytes), inventory_text)
-
         _update_order_context_sync(chat_id, reply, inventory_items)
         await save_message(chat_id, "user", f"{user_name}: [прислал фото]")
         await save_message(chat_id, "assistant", reply)
@@ -1634,6 +1908,20 @@ async def handle_owner_commands(update: Update, context: ContextTypes.DEFAULT_TY
         count = await wishlist_notify(context.bot, article, size)
         await update.message.reply_text(f"✅ Уведомлено {count} покупателей из вишлиста ({article} / {size})")
 
+    # /newstock — уведомить всю базу о новой партии
+    elif text.startswith("/newstock"):
+        await update.message.reply_text("📢 Отправляю уведомление всей базе клиентов...")
+        asyncio.create_task(notify_new_stock(context.bot))
+        await update.message.reply_text("✅ Запущено!")
+
+    # /report — ручной запрос отчёта по незакрытым диалогам
+    elif text.startswith("/report"):
+        await send_daily_unclosed_report()
+
+    # /stockcheck — проверить что заканчивается
+    elif text.startswith("/stockcheck"):
+        await check_low_stock_alert()
+
     # /wishlist — показать весь список ожидания
     elif text.startswith("/wishlist"):
         if not db_pool:
@@ -1781,16 +2069,22 @@ def main():
             owner_app.add_handler(CommandHandler("done", handle_owner_commands))
             owner_app.add_handler(CommandHandler("notify", handle_owner_commands))
             owner_app.add_handler(CommandHandler("wishlist", handle_owner_commands))
+            owner_app.add_handler(CommandHandler("newstock", handle_owner_commands))
+            owner_app.add_handler(CommandHandler("report", handle_owner_commands))
+            owner_app.add_handler(CommandHandler("stockcheck", handle_owner_commands))
             owner_app.add_handler(MessageHandler(filters.PHOTO, handle_owner_photo))
             owner_app.add_handler(MessageHandler(filters.TEXT & filters.REPLY, handle_owner_reply))
 
-            # /post — через content_agent
+            # Импорт команды /post из content_agent
             try:
                 from content_agent import cmd_post as handle_post_cmd, handle_callback as handle_pub_callback
                 owner_app.add_handler(CommandHandler("post", handle_post_cmd))
                 owner_app.add_handler(CallbackQueryHandler(handle_pub_callback, pattern="^pub_"))
             except Exception as e:
                 print(f"[owner] content_agent import error: {e}")
+
+            # Запускаем ежедневные задачи
+            asyncio.create_task(run_daily_tasks(owner_app.bot))
 
             await owner_app.initialize()
             await owner_app.start()
