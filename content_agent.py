@@ -40,6 +40,9 @@ async def get_inventory() -> tuple:
         async with httpx.AsyncClient(timeout=10) as http:
             resp = await http.get(N8N_INVENTORY_URL)
             data = resp.json()
+            # n8n возвращает {"inventory": [...]} или просто [...]
+            if isinstance(data, dict):
+                data = data.get("inventory", data.get("items", []))
             print(f"[content] склад получен: {len(data) if isinstance(data, list) else 'не список'} записей")
             if isinstance(data, list):
                 items = [i for i in data if int(i.get("stock", 0)) > 0]
