@@ -456,12 +456,28 @@ async def cmd_post(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def run():
     """Просто запускаем планировщик — без polling."""
-    # Создаём бота только для отправки сообщений
     from telegram import Bot
+    from datetime import timezone, timedelta
     bot = Bot(token=CONTENT_BOT_TOKEN)
     print("[content] бот @irioqwqhdqdiw12332_bot инициализирован")
+
+    # Пишем в HQ что контент-агент на линии
+    try:
+        msk = timezone(timedelta(hours=3))
+        now = datetime.now(msk).strftime("%d.%m.%Y %H:%M")
+        owner_token = os.getenv("TELEGRAM_BOT_TOKEN")
+        async with httpx.AsyncClient(timeout=5) as http:
+            await http.post(
+                f"https://api.telegram.org/bot{owner_token}/sendMessage",
+                json={
+                    "chat_id": -1004385799918,
+                    "text": f"📢 Контент-агент на линии · {now} МСК\nПостинг в @kroshide активен · 5 постов в день"
+                }
+            )
+    except Exception as e:
+        print(f"[content] hq notify error: {e}")
+
     asyncio.create_task(run_scheduler(bot))
-    # Держим живым
     await asyncio.Event().wait()
 
 

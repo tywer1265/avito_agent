@@ -1797,8 +1797,12 @@ def main():
             await owner_app.updater.start_polling(drop_pending_updates=True)
             print("Оба бота запущены")
 
+            # Московское время
+            from datetime import timezone, timedelta
+            msk = timezone(timedelta(hours=3))
+            now = datetime.now(msk).strftime("%d.%m.%Y %H:%M")
+
             # Стартовое сообщение владельцу
-            now = datetime.now().strftime("%d.%m.%Y %H:%M")
             try:
                 owner_token = os.getenv("TELEGRAM_BOT_TOKEN")
                 async with httpx.AsyncClient(timeout=5) as http:
@@ -1810,15 +1814,16 @@ def main():
                                 f"🚀 KROSHIDE AI technologies development запущен\n\n"
                                 f"Агенты на линии:\n"
                                 f"• Тёма — менеджер покупателей (@oqwiendowqej3213_bot)\n"
-                                f"• Тимка — бухгалтер и аналитик (@tema22_38bot)\n\n"
-                                f"Время запуска: {now}"
+                                f"• Тимка — бухгалтер и аналитик (@tema22_38bot)\n"
+                                f"• Контент-агент — постинг в канал (@irioqwqhdqdiw12332_bot)\n\n"
+                                f"Время запуска: {now} МСК"
                             )
                         }
                     )
             except Exception as e:
                 print(f"[startup] notify error: {e}")
 
-            # Сообщение в HQ чат
+            # Сообщение в HQ чат (General тема)
             try:
                 client_token = os.getenv("CLIENT_BOT_TOKEN")
                 async with httpx.AsyncClient(timeout=5) as http:
@@ -1827,14 +1832,12 @@ def main():
                         json={
                             "chat_id": HQ_CHAT_ID,
                             "text": (
-                                f"🤖 Тёма на связи\n"
-                                f"Время: {now}\n\n"
-                                f"Команды:\n"
-                                f"@Тёма остатки — что заканчивается\n"
-                                f"@Тёма склад — полный список\n"
-                                f"@Тёма незакрытые — диалоги без покупки\n"
-                                f"@Тёма вишлист — кто ждёт товар\n"
-                                f"@Тёма [любой вопрос] — отвечу"
+                                f"🚀 KROSHIDE AI technologies development запущен\n\n"
+                                f"Агенты на линии:\n"
+                                f"• Тёма — менеджер покупателей\n"
+                                f"• Тимка — бухгалтер и аналитик\n"
+                                f"• Контент-агент — постинг в канал\n\n"
+                                f"Время: {now} МСК"
                             )
                         }
                     )
