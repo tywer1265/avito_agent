@@ -1118,8 +1118,65 @@ async def notify_new_stock(bot) -> None:
         print(f"[new_stock] error: {e}")
 
 
+async def send_nightly_backup(bot) -> None:
+    """Ночной бэкап в 03:00 МСК — шлём JSON в бот владельца."""
+    if not db_pool:
+        return
+    try:
+        import json as json_mod
+        import io
+
+        async with db_pool.acquire() as conn:
+            # Клиенты
+            clients = await conn.fetch("""
+                SELECT DISTINCT chat_id, MAX(created_at) as last_seen,
+                COUNT(*) as messages
+                FROM tg_conversations GROUP BY chat_id
+            """)
+
+            # Вишлист
+            wishlist = await conn.fetch("SELECT * FROM wishlist")
+
+            # Интерес к товарам за последние 7 дней
+            interests = await conn.fetch("""
+                SELECT * FROM product_interest
+                WHERE created_at > NOW() - INTERVAL '7 days'
+                ORDER BY created_at DESC
+            """)
+
+            # Фото
+            photos = await conn.fetch("SELECT article, COUNT(*) as cnt FROM product_photos GROUP BY article")
+
+        data = {
+            "backup_date": datetime.now().strftime("%d.%m.%Y %H:%M МСК"),
+            "clients": [{"chat_id": r["chat_id"], "last_seen": str(r["last_seen"]), "messages": r["messages"]} for r in clients],
+            "wishlist": [{"user": r["user_name"], "product": r["product_name"], "size": r["size"]} for r in wishlist],
+            "product_interests_7d": [{"product": r["product_name"], "size": r["size"], "date": str(r["created_at"])} for r in interests],
+            "photos": [{"article": r["article"], "count": r["cnt"]} for r in photos],
+        }
+
+        # Создаём файл
+        json_bytes = json_mod.dumps(data, ensure_ascii=False, indent=2).encode("utf-8")
+        file_obj = io.BytesIO(json_bytes)
+        file_obj.name = f"backup_{datetime.now().strftime('%d%m%Y')}.json"
+
+        await bot.send_document(
+            chat_id=OWNER_CHAT_ID,
+            document=file_obj,
+            caption=(
+                f"🗄 Ночной бэкап KROSHIDE\n"
+                f"Клиентов: {len(clients)}\n"
+                f"Вишлист: {len(wishlist)}\n"
+                f"Фото товаров: {sum(r['cnt'] for r in photos)} шт"
+            )
+        )
+        print(f"[backup] отправлен: {len(clients)} клиентов")
+    except Exception as e:
+        print(f"[backup] error: {e}")
+
+
 async def run_daily_tasks(bot) -> None:
-    """Ежедневные задачи в 21:00 МСК — Тёма пишет отчёт в General HQ."""
+    """Ежедневные задачи — отчёт в 21:00 и бэкап в 03:00 МСК."""
     from datetime import timezone, timedelta
     msk = timezone(timedelta(hours=3))
 
@@ -1133,30 +1190,34 @@ async def run_daily_tasks(bot) -> None:
     while True:
         try:
             now = datetime.now(msk)
-            target = now.replace(hour=21, minute=0, second=0, microsecond=0)
-            if target <= now:
-                target = target + timedelta(days=1)
-            wait = (target - now).total_seconds()
-            print(f"[daily] отчёт через {wait/3600:.1f}ч")
-            await asyncio.sleep(wait)
 
-            # Тёма генерирует отчёт
-            report = await build_tema_daily_report()
-            if report:
-                # Пишем в General (thread_id=None = General)
-                client_token = os.getenv("CLIENT_BOT_TOKEN")
-                async with httpx.AsyncClient(timeout=10) as http:
-                    await http.post(
-                        f"https://api.telegram.org/bot{client_token}/sendMessage",
-                        json={
-                            "chat_id": HQ_CHAT_ID,
-                            "text": report
-                        }
-                    )
-                print("[daily] отчёт отправлен в General HQ")
+            report_time = now.replace(hour=21, minute=0, second=0, microsecond=0)
+            backup_time = now.replace(hour=3, minute=0, second=0, microsecond=0)
+            if backup_time <= now:
+                backup_time += timedelta(days=1)
+            if report_time <= now:
+                report_time += timedelta(days=1)
 
-            # Отчёт по незакрытым диалогам — в тему Тёма
-            await send_daily_unclosed_report()
+            next_event = min(report_time, backup_time)
+            wait = (next_event - now).total_seconds()
+            is_backup = next_event == backup_time
+
+            print(f"[daily] следующее: {'бэкап' if is_backup else 'отчёт'} через {wait/3600:.1f}ч")
+            await asyncio.sleep(max(wait, 1))
+
+            if is_backup:
+                await send_nightly_backup(bot)
+            else:
+                report = await build_tema_daily_report()
+                if report:
+                    client_token = os.getenv("CLIENT_BOT_TOKEN")
+                    async with httpx.AsyncClient(timeout=10) as http:
+                        await http.post(
+                            f"https://api.telegram.org/bot{client_token}/sendMessage",
+                            json={"chat_id": HQ_CHAT_ID, "text": report}
+                        )
+                    print("[daily] отчёт отправлен в General HQ")
+                await send_daily_unclosed_report()
 
         except asyncio.CancelledError:
             break
