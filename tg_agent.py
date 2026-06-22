@@ -2037,6 +2037,46 @@ async def handle_owner_commands(update: Update, context: ContextTypes.DEFAULT_TY
         deleted = await delete_product_photos(article)
         await update.message.reply_text(f"🗑 Удалено {deleted} фото для артикула {article}")
 
+    # /done — завершить загрузку фото
+    elif text.startswith("/done"):
+        owner_chat_id = update.effective_chat.id
+        if owner_chat_id in pending_photo_article:
+            article = pending_photo_article.pop(owner_chat_id)
+            photos = await get_product_photos(article)
+            await update.message.reply_text(
+                f"✅ Загрузка завершена!\n"
+                f"Артикул: {article}\n"
+                f"Всего фото: {len(photos)}"
+            )
+        else:
+            await update.message.reply_text("Нет активной загрузки фото.")
+
+    # /listphotos артикул
+    elif text.startswith("/listphotos"):
+        parts = text.split(maxsplit=1)
+        if len(parts) < 2:
+            await update.message.reply_text("Использование: /listphotos АРТИКУЛ")
+            return
+        article = parts[1].strip().upper()
+        photos = await get_product_photos(article)
+        if not photos:
+            await update.message.reply_text(f"❌ Фото для {article} не найдены")
+            return
+        await update.message.reply_text(f"📸 Фото для {article}: {len(photos)} шт.")
+
+    # /wishlist — показать весь список ожидания
+    elif text.startswith("/wishlist"):
+        if not db_pool:
+            await update.message.reply_text("БД недоступна")
+            return
+        async with db_pool.acquire() as conn:
+            rows = await conn.fetch("SELECT product_name, size, user_name, chat_id FROM wishlist ORDER BY product_name, size")
+        if not rows:
+            await update.message.reply_text("Вишлист пуст")
+            return
+        lines = [f"• {r['product_name']} / {r['size']} — {r['user_name']}" for r in rows]
+        await update.message.reply_text("📋 Вишлист:\n" + "\n".join(lines))
+
     # /notify артикул размер — уведомить вишлист
     elif text.startswith("/notify"):
         parts = text.split()
@@ -2257,6 +2297,26 @@ def main():
             await owner_app.start()
             await owner_app.updater.start_polling(drop_pending_updates=True)
             print("Оба бота запущены")
+
+            # Устанавливаем команды для бота владельца
+            try:
+                await owner_app.bot.set_my_commands([
+                    ("addphoto", "Добавить фото товара — /addphoto АРТИКУЛ"),
+                    ("done", "Завершить загрузку фото"),
+                    ("deletephoto", "Удалить фото — /deletephoto АРТИКУЛ"),
+                    ("listphotos", "Список фото — /listphotos АРТИКУЛ"),
+                    ("notify", "Уведомить вишлист — /notify АРТИКУЛ РАЗМЕР"),
+                    ("wishlist", "Показать весь вишлист"),
+                    ("newstock", "Уведомить базу о новой партии"),
+                    ("report", "Отчёт по незакрытым диалогам"),
+                    ("stockcheck", "Проверить что заканчивается"),
+                    ("confirm", "Подтвердить наличие — /confirm ID да/нет"),
+                    ("resume", "Включить агента — /resume CHAT_ID"),
+                    ("post", "Пост в канал — /post или /post АРТИКУЛ"),
+                ])
+                print("[owner] команды установлены")
+            except Exception as e:
+                print(f"[owner] set_commands error: {e}")
 
             # Московское время
             from datetime import timezone, timedelta
