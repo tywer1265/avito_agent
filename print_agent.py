@@ -136,7 +136,7 @@ def get_confirmed_orders(sheets) -> list[dict]:
         if len(row) < 5:
             continue
         status = row[4].strip() if len(row) > 4 else ""
-        if status != "Подтверждён":
+        if status.replace("ё", "е") != "Подтвержден":
             continue
         article = row[10].strip() if len(row) > 10 else ""
         order_id = row[0].strip() if row else ""
