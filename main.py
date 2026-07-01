@@ -179,7 +179,6 @@ async def avito_webhook(payload: dict):
     log.info("webhook.avito", event_type=event_type)
 
     if event_type == "new_message":
-        # Trigger client manager immediately (within SLA)
         from agents.client_manager import ClientManagerAgent
         agent = ClientManagerAgent()
         asyncio.create_task(agent.run({"trigger": "message_poll"}))
@@ -188,7 +187,6 @@ async def avito_webhook(payload: dict):
         order_id = payload.get("object_id")
         new_status = payload.get("new_status")
         log.info("webhook.order_status", order_id=order_id, status=new_status)
-        # Could update order in DB here
 
     return {"status": "received"}
 
@@ -225,7 +223,6 @@ if __name__ == "__main__":
 # ── Telegram client bot (runs alongside FastAPI) ──────────
 import threading
 import subprocess
-import sys
 
 def run_tg_bot():
     subprocess.run([sys.executable, "tg_agent.py"])
@@ -235,3 +232,9 @@ threading.Thread(target=run_tg_bot, daemon=True).start()
 # Запускаем контент-агента
 from content_agent import start_content_agent
 start_content_agent()
+
+# Запускаем print agent
+def run_print_agent():
+    subprocess.run([sys.executable, "print_agent.py"])
+
+threading.Thread(target=run_print_agent, daemon=True).start()
