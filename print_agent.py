@@ -103,13 +103,17 @@ async def init_db():
 # ── GOOGLE DRIVE ──────────────────────────────────────────────────────────────
 def find_drive_file(drive, article: str) -> str | None:
     for ext in ["png", "jpg", "jpeg", "pdf"]:
+        fname = f"{article}.{ext}"
         result = drive.files().list(
-            q=f"name='{article}.{ext}' and '{DRIVE_FOLDER_ID}' in parents and trashed=false",
-            fields="files(id,name)"
+            q=f"name='{fname}' and '{DRIVE_FOLDER_ID}' in parents and trashed=false",
+            fields="files(id,name,size,mimeType)"
         ).execute()
         files = result.get("files", [])
         if files:
-            return files[0]["id"]
+            f = files[0]
+            logger.info(f"find_drive_file: найден {f['name']} id={f['id']} size={f.get('size','?')} mime={f.get('mimeType','?')}")
+            return f["id"]
+    logger.warning(f"find_drive_file: НЕ найден {article} в папке {DRIVE_FOLDER_ID}")
     return None
 
 def download_drive_file(drive, file_id: str) -> bytes:
@@ -118,8 +122,10 @@ def download_drive_file(drive, file_id: str) -> bytes:
     downloader = MediaIoBaseDownload(buf, request)
     done = False
     while not done:
-        _, done = downloader.next_chunk()
-    return buf.getvalue()
+        status, done = downloader.next_chunk()
+    data = buf.getvalue()
+    logger.info(f"download_drive_file: {file_id} → {len(data)//1024} KB")
+    return data
 
 # ── GOOGLE SHEETS ─────────────────────────────────────────────────────────────
 def get_confirmed_orders(sheets_svc) -> list[dict]:
