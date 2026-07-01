@@ -465,6 +465,18 @@ async def main():
         await app.start()
         await app.updater.start_polling(drop_pending_updates=True)
 
+        # Выпадающее меню команд в Telegram
+        from telegram import BotCommand
+        await app.bot.set_my_commands([
+            BotCommand("start",      "Запустить агента"),
+            BotCommand("makesheet",  "Собрать лист на печать сейчас"),
+            BotCommand("good",       "Одобрить лист — отправить в печать"),
+            BotCommand("nostop",     "Лист не готов — продолжить накапливать"),
+            BotCommand("status",     "Текущая очередь принтов"),
+            BotCommand("listprints", "База всех принтов"),
+            BotCommand("addprint",   "Добавить принт: /addprint АРТИКУЛ НАЗВАНИЕ"),
+        ])
+
         # Стартовое сообщение
         await app.bot.send_message(
             OWNER_CHAT_ID,
