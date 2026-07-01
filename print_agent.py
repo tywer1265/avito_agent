@@ -199,15 +199,19 @@ def pack_images(images_with_widths: list[tuple[Image.Image, int | None]]) -> Ima
     return sheet
 
 def sheet_to_pdf(pil_image: Image.Image) -> bytes:
-    buf = io.BytesIO()
-    pdf = canvas.Canvas(buf, pagesize=(SHEET_W_CM * cm, SHEET_H_CM * cm))
-    with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
-        pil_image.save(tmp.name, "PNG")
-        tmp_path = tmp.name
-    pdf.drawImage(tmp_path, 0, 0, width=SHEET_W_CM * cm, height=SHEET_H_CM * cm, mask="auto")
+    """Конвертирует PIL Image в PDF. Прозрачный фон через PNG байты."""
+    # Сохраняем PNG во временный файл (reportlab требует путь или ImageReader)
+    from reportlab.lib.utils import ImageReader
+    png_buf = io.BytesIO()
+    pil_image.save(png_buf, "PNG")
+    png_buf.seek(0)
+    img_reader = ImageReader(png_buf)
+
+    pdf_buf = io.BytesIO()
+    pdf = canvas.Canvas(pdf_buf, pagesize=(SHEET_W_CM * cm, SHEET_H_CM * cm))
+    pdf.drawImage(img_reader, 0, 0, width=SHEET_W_CM * cm, height=SHEET_H_CM * cm, mask="auto")
     pdf.save()
-    os.unlink(tmp_path)
-    return buf.getvalue()
+    return pdf_buf.getvalue()
 
 # ── CORE: BUILD SHEET FROM ORDERS ─────────────────────────────────────────────
 async def build_print_sheet() -> tuple[bytes | None, list[str], int | None]:
