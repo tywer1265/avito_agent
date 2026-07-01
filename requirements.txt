@@ -39,7 +39,8 @@ python-dateutil==2.9.0.post0   # date parsing helpers
 # ── Monitoring / cost tracking ────────────────
 prometheus-client==0.21.1      # optional: expose /metrics endpoint
 
-# ── Dev / testing (not installed in prod) ─────
-# pytest==8.3.4
-# pytest-asyncio==0.24.0
-# respx==0.21.1                # mock httpx in tests
+# ── Print Agent ───────────────────────────────
+Pillow==10.4.0                 # image processing for gang sheet
+reportlab==4.2.2               # PDF generation
+google-auth==2.35.0            # Google Service Account auth
+google-api-python-client==2.149.0  # Drive + Sheets API
