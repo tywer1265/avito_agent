@@ -35,7 +35,7 @@ GOOGLE_SA_JSON   = os.getenv("GOOGLE_SA_JSON")
 
 SHEET_W_CM = 57
 SHEET_H_CM = 100
-DPI        = 150
+DPI        = 300  # 300 dpi — стандарт печати, Photoshop открывать при 300 ppi
 SHEET_W_PX = int(SHEET_W_CM / 2.54 * DPI)
 SHEET_H_PX = int(SHEET_H_CM / 2.54 * DPI)
 
@@ -150,8 +150,9 @@ def get_confirmed_orders(sheets_svc) -> list[dict]:
 
 # ── IMAGE HELPERS ─────────────────────────────────────────────────────────────
 def cm_to_px(width_cm: float) -> int:
-    px = int(width_cm / 2.54 * DPI)
-    logger.info(f"cm_to_px: {width_cm} см → {px} px (лист {SHEET_W_CM} см = {SHEET_W_PX} px)")
+    """Конвертирует см в пиксели через пропорцию листа — точно независимо от DPI."""
+    px = int(SHEET_W_PX * width_cm / SHEET_W_CM)
+    logger.info(f"cm_to_px: {width_cm} см → {px} px из {SHEET_W_PX} (лист {SHEET_W_CM} см)")
     return px
 
 def resize_to_width(img: Image.Image, target_px: int) -> Image.Image:
