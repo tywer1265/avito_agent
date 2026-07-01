@@ -8,8 +8,7 @@ from datetime import datetime, date
 from zoneinfo import ZoneInfo
 import httpx
 from PIL import Image
-from reportlab.pdfgen import canvas
-from reportlab.lib.units import cm
+# reportlab убран - используем PNG напрямую
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
 from telegram.ext import (
     Application, CommandHandler, CallbackQueryHandler,
@@ -198,35 +197,13 @@ def pack_images(images_with_widths: list[tuple[Image.Image, int | None]]) -> Ima
 
     return sheet
 
-def sheet_to_pdf(pil_image: Image.Image) -> bytes:
-    """Конвертирует PIL Image в PDF. Запускается в отдельном потоке."""
-    import tempfile, os
-    from reportlab.lib.units import cm as cm_unit
-
-    # Сохраняем PNG во временный файл
-    tmp_fd, tmp_path = tempfile.mkstemp(suffix=".png")
-    os.close(tmp_fd)
-    try:
-        # Сохраняем как PNG с прозрачностью
-        pil_image.save(tmp_path, "PNG", optimize=False)
-        logger.info(f"PNG: {tmp_path}, {os.path.getsize(tmp_path)//1024} KB")
-
-        pdf_buf = io.BytesIO()
-        pdf = canvas.Canvas(pdf_buf, pagesize=(SHEET_W_CM * cm_unit, SHEET_H_CM * cm_unit))
-        # preserveAspectRatio=False, anchor не используем — просто растягиваем на лист
-        pdf.drawImage(tmp_path, 0, 0,
-                      width=SHEET_W_CM * cm_unit,
-                      height=SHEET_H_CM * cm_unit,
-                      mask="auto")
-        pdf.save()
-        result = pdf_buf.getvalue()
-        logger.info(f"PDF: {len(result)//1024} KB")
-        return result
-    finally:
-        try:
-            os.unlink(tmp_path)
-        except Exception:
-            pass
+def sheet_to_png(pil_image: Image.Image) -> bytes:
+    """Сохраняет лист как PNG с прозрачностью."""
+    buf = io.BytesIO()
+    pil_image.save(buf, "PNG")
+    result = buf.getvalue()
+    logger.info(f"PNG готов: {len(result)//1024} KB, {pil_image.size}")
+    return result
 
 # ── CORE: BUILD SHEET FROM ORDERS ─────────────────────────────────────────────
 async def build_print_sheet() -> tuple[bytes | None, list[str], int | None]:
@@ -283,7 +260,7 @@ async def build_print_sheet() -> tuple[bytes | None, list[str], int | None]:
 
         def render():
             sheet_img = pack_images(images_with_widths)
-            return sheet_to_pdf(sheet_img)
+            return sheet_to_png(sheet_img)
         logger.info(f"Запускаю pack+pdf в to_thread для {len(images_with_widths)} принтов")
         pdf_bytes = await asyncio.to_thread(render)
         logger.info(f"PDF готов: {len(pdf_bytes)} байт")
@@ -324,7 +301,7 @@ async def build_sheet_from_articles(articles: list[str], custom_widths: dict[str
         logger.info(f"Запускаю pack+pdf в to_thread для {len(images_with_widths)} принтов")
         def render():
             sheet_img = pack_images(images_with_widths)
-            return sheet_to_pdf(sheet_img)
+            return sheet_to_png(sheet_img)
 
         pdf_bytes = await asyncio.to_thread(render)
         logger.info(f"PDF готов: {len(pdf_bytes)} байт")
@@ -560,7 +537,7 @@ async def cmd_done(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if not_found:
             caption += f"\n\n⚠️ Не найдено: {', '.join(not_found)}"
         pdf_file = io.BytesIO(pdf_bytes)
-        pdf_file.name = f"custom_sheet_{date.today()}.pdf"
+        pdf_file.name = f"custom_sheet_{date.today()}.png"
         await ctx.bot.send_document(OWNER_CHAT_ID, document=pdf_file, caption=caption, parse_mode="Markdown")
 
 # ── ОБРАБОТЧИК ТЕКСТОВЫХ СООБЩЕНИЙ (сессия) ──────────────────────────────────
@@ -614,7 +591,7 @@ async def send_sheet_to_owner(bot):
         f"/good — одобрить\n/nostop — лист не готов, накапливать дальше"
     )
     pdf_file = io.BytesIO(pdf_bytes)
-    pdf_file.name = f"print_sheet_{date.today()}.pdf"
+    pdf_file.name = f"print_sheet_{date.today()}.png"
     await bot.send_document(OWNER_CHAT_ID, document=pdf_file, caption=caption, parse_mode="Markdown")
 
 # ── SCHEDULER ─────────────────────────────────────────────────────────────────
