@@ -266,8 +266,12 @@ async def build_print_sheet() -> tuple[bytes | None, list[str], int | None]:
         if not images_with_widths:
             return None, [], sheet_id
 
-        sheet_img = pack_images(images_with_widths)
-        pdf_bytes = sheet_to_pdf(sheet_img)
+        def render():
+            sheet_img = pack_images(images_with_widths)
+            return sheet_to_pdf(sheet_img)
+        logger.info(f"Запускаю pack+pdf в to_thread для {len(images_with_widths)} принтов")
+        pdf_bytes = await asyncio.to_thread(render)
+        logger.info(f"PDF готов: {len(pdf_bytes)} байт")
         return pdf_bytes, added_articles, sheet_id
     finally:
         await conn.close()
@@ -280,16 +284,14 @@ async def build_sheet_from_articles(articles: list[str], custom_widths: dict[str
     try:
         images_with_widths = []
         found = []
-        not_found = []
         for article in articles:
             file_id = find_drive_file(drive, article)
             if not file_id:
-                not_found.append(article)
+                logger.warning(f"Файл не найден: {article}")
                 continue
             file_bytes = download_drive_file(drive, file_id)
             try:
                 img = Image.open(io.BytesIO(file_bytes)).convert("RGBA")
-                # Приоритет: переданная ширина > ширина из базы
                 if article in custom_widths:
                     target_w = cm_to_px(custom_widths[article])
                 else:
@@ -298,14 +300,19 @@ async def build_sheet_from_articles(articles: list[str], custom_widths: dict[str
                 images_with_widths.append((img, target_w))
                 found.append(article)
             except Exception as e:
-                logger.error(f"Ошибка {article}: {e}")
-                not_found.append(article)
+                logger.error(f"Ошибка {article}: {e}", exc_info=True)
 
         if not images_with_widths:
             return None, []
 
-        sheet_img = pack_images(images_with_widths)
-        pdf_bytes = sheet_to_pdf(sheet_img)
+        # CPU-тяжёлые операции выносим в отдельный поток
+        logger.info(f"Запускаю pack+pdf в to_thread для {len(images_with_widths)} принтов")
+        def render():
+            sheet_img = pack_images(images_with_widths)
+            return sheet_to_pdf(sheet_img)
+
+        pdf_bytes = await asyncio.to_thread(render)
+        logger.info(f"PDF готов: {len(pdf_bytes)} байт")
         return pdf_bytes, found
     finally:
         await conn.close()
@@ -524,7 +531,12 @@ async def cmd_done(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await send_sheet_to_owner(ctx.bot)
 
     elif mode == "newfile":
-        pdf_bytes, found = await build_sheet_from_articles(articles, widths)
+        try:
+            pdf_bytes, found = await build_sheet_from_articles(articles, widths)
+        except Exception as e:
+            logger.error(f"Ошибка генерации PDF: {e}", exc_info=True)
+            await update.message.reply_text(f"❌ Ошибка генерации: {e}")
+            return
         if not pdf_bytes:
             await update.message.reply_text("❌ Ни один файл не найден на Drive.")
             return
