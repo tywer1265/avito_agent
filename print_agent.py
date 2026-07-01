@@ -96,11 +96,8 @@ async def init_db():
             UNIQUE(order_id, article)
         );
     """)
-    # Добавляем width_cm если колонки ещё нет (миграция)
-    try:
-        await conn.execute("ALTER TABLE prints ADD COLUMN IF NOT EXISTS width_cm FLOAT")
-    except Exception:
-        pass
+    # Миграция: добавляем width_cm если нет
+    await conn.execute("ALTER TABLE prints ADD COLUMN IF NOT EXISTS width_cm FLOAT")
     await conn.close()
     logger.info("DB init done")
 
@@ -153,7 +150,9 @@ def get_confirmed_orders(sheets_svc) -> list[dict]:
 
 # ── IMAGE HELPERS ─────────────────────────────────────────────────────────────
 def cm_to_px(width_cm: float) -> int:
-    return int(width_cm / 2.54 * DPI)
+    px = int(width_cm / 2.54 * DPI)
+    logger.info(f"cm_to_px: {width_cm} см → {px} px (лист {SHEET_W_CM} см = {SHEET_W_PX} px)")
+    return px
 
 def resize_to_width(img: Image.Image, target_px: int) -> Image.Image:
     ratio = target_px / img.width
@@ -173,11 +172,12 @@ def pack_images(images_with_widths: list[tuple[Image.Image, int | None]]) -> Ima
         img = img.convert("RGBA")
 
         if target_w:
-            # Масштабируем до указанной ширины в пикселях
-            img = resize_to_width(img, min(target_w, SHEET_W_PX))
+            final_w = min(target_w, SHEET_W_PX)
+            logger.info(f"pack: target_w={target_w}px → final={final_w}px = {final_w/SHEET_W_PX*SHEET_W_CM:.1f} см")
+            img = resize_to_width(img, final_w)
         else:
-            # Дефолт: треть ширины листа
             default_w = SHEET_W_PX // 3
+            logger.info(f"pack: no target_w, дефолт={default_w}px = {default_w/SHEET_W_PX*SHEET_W_CM:.1f} см")
             img = resize_to_width(img, default_w)
 
         # Если не влезает в строку — новая строка
