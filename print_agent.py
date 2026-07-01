@@ -106,13 +106,20 @@ def find_drive_file(drive, article: str) -> str | None:
         fname = f"{article}.{ext}"
         result = drive.files().list(
             q=f"name='{fname}' and '{DRIVE_FOLDER_ID}' in parents and trashed=false",
-            fields="files(id,name,size,mimeType)"
+            fields="files(id,name,size,mimeType)",
+            orderBy="createdTime desc"  # берём самый новый
         ).execute()
         files = result.get("files", [])
         if files:
-            f = files[0]
-            logger.info(f"find_drive_file: найден {f['name']} id={f['id']} size={f.get('size','?')} mime={f.get('mimeType','?')}")
-            return f["id"]
+            # Берём первый файл с ненулевым размером
+            for f in files:
+                size = int(f.get("size", 0))
+                logger.info(f"find_drive_file: {f['name']} id={f['id']} size={size} mime={f.get('mimeType','?')}")
+                if size > 1024:  # минимум 1KB — не битый
+                    return f["id"]
+            # Если все маленькие — берём первый
+            logger.warning(f"find_drive_file: все файлы подозрительно маленькие, берём первый")
+            return files[0]["id"]
     logger.warning(f"find_drive_file: НЕ найден {article} в папке {DRIVE_FOLDER_ID}")
     return None
 
