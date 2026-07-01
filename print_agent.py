@@ -410,6 +410,26 @@ async def cmd_addprint(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     else:
         await update.message.reply_text(f"⚠️ Принт `{article}` добавлен, но файл на Drive не найден. Загрузи `{article}.png` в папку Prints.", parse_mode="Markdown")
 
+async def cmd_resetqueue(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != OWNER_CHAT_ID:
+        return
+    conn = await get_db()
+    today = date.today()
+    # Удаляем очередь и открытый лист за сегодня
+    sheet = await conn.fetchrow(
+        "SELECT id FROM print_sheets WHERE sheet_date=$1 AND status='open' ORDER BY id DESC LIMIT 1", today
+    )
+    if sheet:
+        deleted = await conn.fetchval(
+            "DELETE FROM print_queue WHERE sheet_id=$1 RETURNING count(*)", sheet["id"]
+        )
+        await conn.execute("DELETE FROM print_sheets WHERE id=$1", sheet["id"])
+        await conn.close()
+        await update.message.reply_text(f"🗑 Очередь сброшена. Удалено записей: {deleted or 0}.\nТеперь /makesheet соберёт лист заново.")
+    else:
+        await conn.close()
+        await update.message.reply_text("Нет открытого листа для сброса.")
+
 # ── SEND SHEET TO OWNER ───────────────────────────────────────────────────────
 async def send_sheet_to_owner(bot):
     """Собирает gang sheet и отправляет владельцу на одобрение."""
@@ -469,7 +489,8 @@ async def main():
     app.add_handler(CommandHandler("good",       cmd_good))
     app.add_handler(CommandHandler("nostop",     cmd_nostop))
     app.add_handler(CommandHandler("listprints", cmd_listprints))
-    app.add_handler(CommandHandler("addprint",   cmd_addprint))
+    app.add_handler(CommandHandler("addprint",    cmd_addprint))
+    app.add_handler(CommandHandler("resetqueue",  cmd_resetqueue))
 
     # Запускаем планировщик параллельно
     async with app:
@@ -485,7 +506,8 @@ async def main():
             BotCommand("nostop",     "Лист не готов — продолжить накапливать"),
             BotCommand("status",     "Текущая очередь принтов"),
             BotCommand("listprints", "База всех принтов"),
-            BotCommand("addprint",   "Добавить принт: /addprint АРТИКУЛ НАЗВАНИЕ"),
+            BotCommand("addprint",    "Добавить принт: /addprint АРТИКУЛ НАЗВАНИЕ"),
+            BotCommand("resetqueue",  "Сбросить очередь и собрать лист заново"),
         ])
 
         # Стартовое сообщение
