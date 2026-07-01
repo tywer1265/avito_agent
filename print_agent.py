@@ -35,7 +35,7 @@ GOOGLE_SA_JSON   = os.getenv("GOOGLE_SA_JSON")
 
 SHEET_W_CM = 57
 SHEET_H_CM = 100
-DPI        = 300  # 300 dpi — стандарт печати, Photoshop открывать при 300 ppi
+DPI        = 150  # 150 dpi — оптимум: качество печати + manageable file size
 SHEET_W_PX = int(SHEET_W_CM / 2.54 * DPI)
 SHEET_H_PX = int(SHEET_H_CM / 2.54 * DPI)
 
@@ -207,20 +207,20 @@ def sheet_to_pdf(pil_image: Image.Image) -> bytes:
     tmp_fd, tmp_path = tempfile.mkstemp(suffix=".png")
     os.close(tmp_fd)
     try:
-        # Конвертируем RGBA в RGB с белым фоном для совместимости
-        # Прозрачные пиксели останутся прозрачными через маску
-        pil_image.save(tmp_path, "PNG")
-        logger.info(f"PNG сохранён: {tmp_path}, размер {os.path.getsize(tmp_path)} байт")
+        # Сохраняем как PNG с прозрачностью
+        pil_image.save(tmp_path, "PNG", optimize=False)
+        logger.info(f"PNG: {tmp_path}, {os.path.getsize(tmp_path)//1024} KB")
 
         pdf_buf = io.BytesIO()
         pdf = canvas.Canvas(pdf_buf, pagesize=(SHEET_W_CM * cm_unit, SHEET_H_CM * cm_unit))
+        # preserveAspectRatio=False, anchor не используем — просто растягиваем на лист
         pdf.drawImage(tmp_path, 0, 0,
                       width=SHEET_W_CM * cm_unit,
-                      height=SHEET_H_CM * cm_unit,
-                      mask="auto")
+                      height=SHEET_H_CM * cm_unit)
         pdf.save()
-        logger.info(f"PDF сгенерирован: {len(pdf_buf.getvalue())} байт")
-        return pdf_buf.getvalue()
+        result = pdf_buf.getvalue()
+        logger.info(f"PDF: {len(result)//1024} KB")
+        return result
     finally:
         try:
             os.unlink(tmp_path)
