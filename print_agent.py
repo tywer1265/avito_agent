@@ -10,7 +10,7 @@ import httpx
 from PIL import Image
 from reportlab.pdfgen import canvas
 from reportlab.lib.units import cm
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
 from telegram.ext import (
     Application, CommandHandler, CallbackQueryHandler,
     MessageHandler, filters, ContextTypes
@@ -25,30 +25,32 @@ logger = logging.getLogger("print_agent")
 
 MSK = ZoneInfo("Europe/Moscow")
 
-# ── ENV ──────────────────────────────────────────────────────────────────────
-PRINT_BOT_TOKEN     = os.getenv("PRINT_BOT_TOKEN")
-OWNER_CHAT_ID       = int(os.getenv("TELEGRAM_OWNER_CHAT_ID", "5016220108"))
-DATABASE_URL        = os.getenv("DATABASE_URL_ASYNCPG")
-SHEETS_ID           = "1oE7xI_BwogoHCZ0On8rzjNlHCLUfquXMJgAvpM25rNI"
-DRIVE_FOLDER_ID     = "1KHe5PmOTV-ql4FbdjSpKMXLX1z7cn1q-"
-GOOGLE_SA_JSON      = os.getenv("GOOGLE_SA_JSON")  # JSON строка в env
+# ── ENV ───────────────────────────────────────────────────────────────────────
+PRINT_BOT_TOKEN  = os.getenv("PRINT_BOT_TOKEN")
+OWNER_CHAT_ID    = int(os.getenv("TELEGRAM_OWNER_CHAT_ID", "5016220108"))
+DATABASE_URL     = os.getenv("DATABASE_URL_ASYNCPG")
+SHEETS_ID        = "1oE7xI_BwogoHCZ0On8rzjNlHCLUfquXMJgAvpM25rNI"
+DRIVE_FOLDER_ID  = "1KHe5PmOTV-ql4FbdjSpKMXLX1z7cn1q-"
+GOOGLE_SA_JSON   = os.getenv("GOOGLE_SA_JSON")
 
-# Размер листа: 57 x 100 см при 150 dpi (оптимум для генерации)
-SHEET_W_CM  = 57
-SHEET_H_CM  = 100
-DPI         = 150
-SHEET_W_PX  = int(SHEET_W_CM / 2.54 * DPI)
-SHEET_H_PX  = int(SHEET_H_CM / 2.54 * DPI)
+SHEET_W_CM = 57
+SHEET_H_CM = 100
+DPI        = 150
+SHEET_W_PX = int(SHEET_W_CM / 2.54 * DPI)
+SHEET_H_PX = int(SHEET_H_CM / 2.54 * DPI)
+
+# ── SESSION STATE (in-memory) ─────────────────────────────────────────────────
+# Хранит состояние интерактивных сессий
+# { chat_id: { "mode": "addtosheet"|"newfile", "articles": [], "widths": {} } }
+SESSION: dict = {}
 
 # ── GOOGLE AUTH ───────────────────────────────────────────────────────────────
 def get_google_services():
     if GOOGLE_SA_JSON:
         info = json.loads(GOOGLE_SA_JSON)
     else:
-        # fallback: читаем файл если есть локально
         with open("kroshide-4ee49a8d1bd5.json") as f:
             info = json.load(f)
-
     scopes = [
         "https://www.googleapis.com/auth/drive.readonly",
         "https://www.googleapis.com/auth/spreadsheets.readonly",
@@ -66,43 +68,47 @@ async def init_db():
     conn = await get_db()
     await conn.execute("""
         CREATE TABLE IF NOT EXISTS prints (
-            id          SERIAL PRIMARY KEY,
-            article     TEXT UNIQUE NOT NULL,
-            name        TEXT NOT NULL,
-            colors      TEXT,
-            sizes       TEXT,
+            id            SERIAL PRIMARY KEY,
+            article       TEXT UNIQUE NOT NULL,
+            name          TEXT NOT NULL,
+            colors        TEXT,
+            sizes         TEXT,
+            width_cm      FLOAT,
             drive_file_id TEXT,
-            created_at  TIMESTAMPTZ DEFAULT NOW()
+            created_at    TIMESTAMPTZ DEFAULT NOW()
         );
 
         CREATE TABLE IF NOT EXISTS print_sheets (
-            id          SERIAL PRIMARY KEY,
-            sheet_date  DATE NOT NULL,
-            status      TEXT DEFAULT 'open',
-            tg_file_id  TEXT,
-            created_at  TIMESTAMPTZ DEFAULT NOW()
+            id         SERIAL PRIMARY KEY,
+            sheet_date DATE NOT NULL,
+            status     TEXT DEFAULT 'open',
+            tg_file_id TEXT,
+            created_at TIMESTAMPTZ DEFAULT NOW()
         );
 
         CREATE TABLE IF NOT EXISTS print_queue (
-            id          SERIAL PRIMARY KEY,
-            order_id    TEXT NOT NULL,
-            article     TEXT NOT NULL,
-            sheet_id    INTEGER REFERENCES print_sheets(id),
-            status      TEXT DEFAULT 'pending',
-            added_at    TIMESTAMPTZ DEFAULT NOW(),
+            id       SERIAL PRIMARY KEY,
+            order_id TEXT NOT NULL,
+            article  TEXT NOT NULL,
+            sheet_id INTEGER REFERENCES print_sheets(id),
+            status   TEXT DEFAULT 'pending',
+            added_at TIMESTAMPTZ DEFAULT NOW(),
             UNIQUE(order_id, article)
         );
     """)
+    # Добавляем width_cm если колонки ещё нет (миграция)
+    try:
+        await conn.execute("ALTER TABLE prints ADD COLUMN IF NOT EXISTS width_cm FLOAT")
+    except Exception:
+        pass
     await conn.close()
     logger.info("DB init done")
 
 # ── GOOGLE DRIVE ──────────────────────────────────────────────────────────────
 def find_drive_file(drive, article: str) -> str | None:
-    """Ищет файл по артикулу в папке Prints. Возвращает file_id."""
     for ext in ["png", "jpg", "jpeg", "pdf"]:
-        name = f"{article}.{ext}"
         result = drive.files().list(
-            q=f"name='{name}' and '{DRIVE_FOLDER_ID}' in parents and trashed=false",
+            q=f"name='{article}.{ext}' and '{DRIVE_FOLDER_ID}' in parents and trashed=false",
             fields="files(id,name)"
         ).execute()
         files = result.get("files", [])
@@ -111,7 +117,6 @@ def find_drive_file(drive, article: str) -> str | None:
     return None
 
 def download_drive_file(drive, file_id: str) -> bytes:
-    """Скачивает файл из Drive, возвращает байты."""
     request = drive.files().get_media(fileId=file_id)
     buf = io.BytesIO()
     downloader = MediaIoBaseDownload(buf, request)
@@ -121,12 +126,8 @@ def download_drive_file(drive, file_id: str) -> bytes:
     return buf.getvalue()
 
 # ── GOOGLE SHEETS ─────────────────────────────────────────────────────────────
-def get_confirmed_orders(sheets) -> list[dict]:
-    """
-    Возвращает заказы со статусом 'Подтверждён' из листа 'Продажи'.
-    Колонки: A=Заказ, B=Дата, C=Наименование, D=Размер, E=Статус, K=Артикул
-    """
-    result = sheets.spreadsheets().values().get(
+def get_confirmed_orders(sheets_svc) -> list[dict]:
+    result = sheets_svc.spreadsheets().values().get(
         spreadsheetId=SHEETS_ID,
         range="Продажи!A2:K"
     ).execute()
@@ -138,43 +139,46 @@ def get_confirmed_orders(sheets) -> list[dict]:
         status = row[4].strip() if len(row) > 4 else ""
         if status.replace("ё", "е") != "Подтвержден":
             continue
-        article = row[10].strip() if len(row) > 10 else ""
+        article  = row[10].strip() if len(row) > 10 else ""
         order_id = row[0].strip() if row else ""
         if not article or not order_id:
             continue
         orders.append({
             "order_id": order_id,
-            "name": row[2] if len(row) > 2 else "",
-            "size": row[3] if len(row) > 3 else "",
-            "article": article,
+            "name":     row[2] if len(row) > 2 else "",
+            "size":     row[3] if len(row) > 3 else "",
+            "article":  article,
         })
     return orders
 
-# ── BIN PACKING (простой greedy) ──────────────────────────────────────────────
-def pack_images(images: list[Image.Image]) -> Image.Image:
-    """
-    Упаковывает изображения в лист 57x100 см максимально плотно.
-    Прозрачный фон. Масштабирует принты до 1/3 ширины листа минимум.
-    """
-    sheet = Image.new("RGBA", (SHEET_W_PX, SHEET_H_PX), (0, 0, 0, 0))  # прозрачный фон
-    x, y = 0, 0
-    row_h = 0
+# ── IMAGE HELPERS ─────────────────────────────────────────────────────────────
+def cm_to_px(width_cm: float) -> int:
+    return int(width_cm / 2.54 * DPI)
 
-    # Минимальный размер принта — треть ширины листа
-    MIN_PRINT_W = SHEET_W_PX // 3
+def resize_to_width(img: Image.Image, target_px: int) -> Image.Image:
+    ratio = target_px / img.width
+    return img.resize((target_px, int(img.height * ratio)), Image.LANCZOS)
 
-    for img in images:
+def pack_images(images_with_widths: list[tuple[Image.Image, int | None]]) -> Image.Image:
+    """
+    Компонует принты в лист 57x100 см плотно, сверху вниз.
+    images_with_widths: [(img, target_width_px or None), ...]
+    Прозрачный фон.
+    """
+    sheet  = Image.new("RGBA", (SHEET_W_PX, SHEET_H_PX), (0, 0, 0, 0))
+    x, y   = 0, 0
+    row_h  = 0
+
+    for img, target_w in images_with_widths:
         img = img.convert("RGBA")
 
-        # Масштабируем вверх если принт слишком маленький
-        if img.width < MIN_PRINT_W:
-            ratio = MIN_PRINT_W / img.width
-            img = img.resize((MIN_PRINT_W, int(img.height * ratio)), Image.LANCZOS)
-
-        # Масштабируем вниз если шире листа
-        if img.width > SHEET_W_PX:
-            ratio = SHEET_W_PX / img.width
-            img = img.resize((SHEET_W_PX, int(img.height * ratio)), Image.LANCZOS)
+        if target_w:
+            # Масштабируем до указанной ширины в пикселях
+            img = resize_to_width(img, min(target_w, SHEET_W_PX))
+        else:
+            # Дефолт: треть ширины листа
+            default_w = SHEET_W_PX // 3
+            img = resize_to_width(img, default_w)
 
         # Если не влезает в строку — новая строка
         if x + img.width > SHEET_W_PX:
@@ -184,58 +188,42 @@ def pack_images(images: list[Image.Image]) -> Image.Image:
 
         # Если не влезает по высоте — стоп
         if y + img.height > SHEET_H_PX:
-            logger.warning("Лист заполнен, остаток принтов не уместился")
+            logger.warning("Лист заполнен, остаток не уместился")
             break
 
         sheet.paste(img, (x, y), img)
-        x += img.width
+        x    += img.width
         row_h = max(row_h, img.height)
 
     return sheet
 
 def sheet_to_pdf(pil_image: Image.Image) -> bytes:
-    """Конвертирует PIL Image в PDF байты нужного размера. Прозрачный фон."""
     buf = io.BytesIO()
     pdf = canvas.Canvas(buf, pagesize=(SHEET_W_CM * cm, SHEET_H_CM * cm))
-
-    # Сохраняем как PNG с прозрачностью
     with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
-        pil_image.save(tmp.name, "PNG")  # PNG сохраняет альфа-канал
+        pil_image.save(tmp.name, "PNG")
         tmp_path = tmp.name
-
-    # mask="auto" — reportlab уважает прозрачность PNG
     pdf.drawImage(tmp_path, 0, 0, width=SHEET_W_CM * cm, height=SHEET_H_CM * cm, mask="auto")
     pdf.save()
     os.unlink(tmp_path)
     return buf.getvalue()
 
-# ── CORE: BUILD SHEET ─────────────────────────────────────────────────────────
+# ── CORE: BUILD SHEET FROM ORDERS ─────────────────────────────────────────────
 async def build_print_sheet() -> tuple[bytes | None, list[str], int | None]:
-    """
-    Собирает gang sheet из очереди.
-    Возвращает (pdf_bytes, список артикулов, sheet_id) или (None, [], None)
-    """
     conn = await get_db()
     drive, sheets_svc = get_google_services()
-
     try:
-        # Получаем подтверждённые заказы из Google Sheets
         orders = get_confirmed_orders(sheets_svc)
         logger.info(f"Подтверждённых заказов: {len(orders)}")
 
-        # Открытый лист на сегодня
         today = date.today()
         sheet_row = await conn.fetchrow(
             "SELECT id FROM print_sheets WHERE sheet_date=$1 AND status='open'", today
         )
-        if not sheet_row:
-            sheet_id = await conn.fetchval(
-                "INSERT INTO print_sheets (sheet_date) VALUES ($1) RETURNING id", today
-            )
-        else:
-            sheet_id = sheet_row["id"]
+        sheet_id = sheet_row["id"] if sheet_row else await conn.fetchval(
+            "INSERT INTO print_sheets (sheet_date) VALUES ($1) RETURNING id", today
+        )
 
-        # Фильтруем уже добавленные
         articles_to_print = []
         for order in orders:
             exists = await conn.fetchrow(
@@ -246,57 +234,92 @@ async def build_print_sheet() -> tuple[bytes | None, list[str], int | None]:
                 articles_to_print.append(order)
 
         if not articles_to_print:
-            logger.info("Нет новых принтов для добавления")
             return None, [], sheet_id
 
-        # Скачиваем изображения
-        images = []
+        images_with_widths = []
         added_articles = []
         for order in articles_to_print:
             file_id = find_drive_file(drive, order["article"])
             if not file_id:
-                logger.warning(f"Файл не найден для артикула {order['article']}")
+                logger.warning(f"Файл не найден: {order['article']}")
                 continue
-
             file_bytes = download_drive_file(drive, file_id)
             try:
                 img = Image.open(io.BytesIO(file_bytes)).convert("RGBA")
-                images.append(img)
+                # Берём ширину из базы принтов если есть
+                p = await conn.fetchrow("SELECT width_cm FROM prints WHERE article=$1", order["article"])
+                target_w = cm_to_px(p["width_cm"]) if p and p["width_cm"] else None
+                images_with_widths.append((img, target_w))
                 added_articles.append(order["article"])
-
-                # Записываем в очередь
                 await conn.execute(
                     "INSERT INTO print_queue (order_id, article, sheet_id, status) VALUES ($1,$2,$3,'added') ON CONFLICT DO NOTHING",
                     order["order_id"], order["article"], sheet_id
                 )
             except Exception as e:
-                logger.error(f"Ошибка обработки изображения {order['article']}: {e}")
+                logger.error(f"Ошибка изображения {order['article']}: {e}")
 
-        if not images:
+        if not images_with_widths:
             return None, [], sheet_id
 
-        # Компоновка
-        sheet_img = pack_images(images)
+        sheet_img = pack_images(images_with_widths)
         pdf_bytes = sheet_to_pdf(sheet_img)
-
         return pdf_bytes, added_articles, sheet_id
-
     finally:
         await conn.close()
 
-# ── TELEGRAM BOT ──────────────────────────────────────────────────────────────
+# ── CORE: BUILD SHEET FROM ARTICLE LIST ───────────────────────────────────────
+async def build_sheet_from_articles(articles: list[str], custom_widths: dict[str, float]) -> tuple[bytes | None, list[str]]:
+    """Собирает PDF из произвольного списка артикулов."""
+    conn = await get_db()
+    drive, _ = get_google_services()
+    try:
+        images_with_widths = []
+        found = []
+        not_found = []
+        for article in articles:
+            file_id = find_drive_file(drive, article)
+            if not file_id:
+                not_found.append(article)
+                continue
+            file_bytes = download_drive_file(drive, file_id)
+            try:
+                img = Image.open(io.BytesIO(file_bytes)).convert("RGBA")
+                # Приоритет: переданная ширина > ширина из базы
+                if article in custom_widths:
+                    target_w = cm_to_px(custom_widths[article])
+                else:
+                    p = await conn.fetchrow("SELECT width_cm FROM prints WHERE article=$1", article)
+                    target_w = cm_to_px(p["width_cm"]) if p and p["width_cm"] else None
+                images_with_widths.append((img, target_w))
+                found.append(article)
+            except Exception as e:
+                logger.error(f"Ошибка {article}: {e}")
+                not_found.append(article)
+
+        if not images_with_widths:
+            return None, []
+
+        sheet_img = pack_images(images_with_widths)
+        pdf_bytes = sheet_to_pdf(sheet_img)
+        return pdf_bytes, found
+    finally:
+        await conn.close()
+
+# ── TELEGRAM COMMANDS ──────────────────────────────────────────────────────────
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != OWNER_CHAT_ID:
         return
     await update.message.reply_text(
         "🖨 *Print Agent онлайн*\n\n"
-        "Команды:\n"
-        "/status — текущая очередь\n"
-        "/makesheet — собрать лист прямо сейчас\n"
-        "/good — одобрить лист и закрыть\n"
-        "/nostop — лист ещё не готов, продолжить накапливать\n"
-        "/listprints — все принты в базе\n"
-        "/addprint АРТИКУЛ НАЗВАНИЕ — добавить принт вручную",
+        "*/makesheet* — собрать лист из подтверждённых заказов\n"
+        "*/addtosheet* — добавить принты в текущий лист вручную\n"
+        "*/addnewfile* — создать новый файл из любых принтов\n"
+        "*/good* — одобрить лист\n"
+        "*/nostop* — лист не готов, накапливать дальше\n"
+        "*/status* — очередь\n"
+        "*/listprints* — база принтов\n"
+        "*/addprint АРТИКУЛ НАЗВАНИЕ ШИРИНА\\_СМ* — добавить принт в базу\n"
+        "*/resetqueue* — сбросить очередь",
         parse_mode="Markdown"
     )
 
@@ -312,25 +335,20 @@ async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Сегодня листов нет.")
         await conn.close()
         return
-
-    queue = await conn.fetch(
-        "SELECT article, status FROM print_queue WHERE sheet_id=$1", sheet["id"]
-    )
+    queue = await conn.fetch("SELECT article, status FROM print_queue WHERE sheet_id=$1", sheet["id"])
     await conn.close()
-
     text = f"📋 Лист #{sheet['id']} — статус: *{sheet['status']}*\n\n"
     for q in queue:
         icon = "✅" if q["status"] == "printed" else "🔄"
         text += f"{icon} {q['article']}\n"
     if not queue:
         text += "_Очередь пуста_"
-
     await update.message.reply_text(text, parse_mode="Markdown")
 
 async def cmd_makesheet(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != OWNER_CHAT_ID:
         return
-    await update.message.reply_text("⏳ Собираю лист...")
+    await update.message.reply_text("⏳ Собираю лист из подтверждённых заказов...")
     await send_sheet_to_owner(ctx.bot)
 
 async def cmd_good(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -345,77 +363,77 @@ async def cmd_good(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Нет открытого листа.")
         await conn.close()
         return
-
-    await conn.execute(
-        "UPDATE print_sheets SET status='approved' WHERE id=$1", sheet["id"]
-    )
-    await conn.execute(
-        "UPDATE print_queue SET status='printed' WHERE sheet_id=$1", sheet["id"]
-    )
+    await conn.execute("UPDATE print_sheets SET status='approved' WHERE id=$1", sheet["id"])
+    await conn.execute("UPDATE print_queue SET status='printed' WHERE sheet_id=$1", sheet["id"])
     await conn.close()
-    await update.message.reply_text("✅ Лист одобрен. Принты отмечены как напечатанные.\nСледующие заказы пойдут в новый лист.")
+    await update.message.reply_text("✅ Лист одобрен. Следующие заказы пойдут в новый лист.")
 
 async def cmd_nostop(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != OWNER_CHAT_ID:
         return
     await update.message.reply_text(
-        "⏸ Понял. Лист остаётся открытым.\n"
-        "Новые подтверждённые заказы будут добавляться в него.\n"
-        "Когда будет готов — напиши /good"
+        "⏸ Лист остаётся открытым.\nНовые заказы добавляются в него.\nКогда готов — /good"
     )
 
 async def cmd_listprints(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != OWNER_CHAT_ID:
         return
     conn = await get_db()
-    prints = await conn.fetch("SELECT article, name, colors, sizes FROM prints ORDER BY article")
+    prints = await conn.fetch("SELECT article, name, width_cm FROM prints ORDER BY article")
     await conn.close()
-
     if not prints:
         await update.message.reply_text("База принтов пуста.")
         return
-
     text = "🗂 *База принтов:*\n\n"
     for p in prints:
         text += f"• `{p['article']}` — {p['name']}"
-        if p["colors"]:
-            text += f" | {p['colors']}"
+        if p["width_cm"]:
+            text += f" | {p['width_cm']} см"
         text += "\n"
     await update.message.reply_text(text, parse_mode="Markdown")
 
 async def cmd_addprint(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Добавить принт в базу: /addprint АРТИКУЛ НАЗВАНИЕ ШИРИНА_СМ"""
     if update.effective_user.id != OWNER_CHAT_ID:
         return
     args = ctx.args
     if len(args) < 2:
-        await update.message.reply_text("Использование: /addprint АРТИКУЛ НАЗВАНИЕ [ЦВЕТА]")
+        await update.message.reply_text("Использование: /addprint АРТИКУЛ НАЗВАНИЕ ШИРИНА_СМ\nПример: /addprint a130 Bape Shark 25")
         return
 
     article = args[0]
-    name = " ".join(args[1:])
-    conn = await get_db()
+    # Последний аргумент — ширина если число, иначе часть названия
+    width_cm = None
+    try:
+        width_cm = float(args[-1])
+        name = " ".join(args[1:-1])
+    except ValueError:
+        name = " ".join(args[1:])
 
-    # Проверяем файл на Drive
     drive, _ = get_google_services()
     file_id = find_drive_file(drive, article)
 
+    conn = await get_db()
     await conn.execute(
-        "INSERT INTO prints (article, name, drive_file_id) VALUES ($1,$2,$3) ON CONFLICT (article) DO UPDATE SET name=$2, drive_file_id=$3",
-        article, name, file_id
+        """INSERT INTO prints (article, name, width_cm, drive_file_id)
+           VALUES ($1,$2,$3,$4)
+           ON CONFLICT (article) DO UPDATE SET name=$2, width_cm=$3, drive_file_id=$4""",
+        article, name, width_cm, file_id
     )
     await conn.close()
 
-    if file_id:
-        await update.message.reply_text(f"✅ Принт `{article}` добавлен. Файл найден на Drive.", parse_mode="Markdown")
-    else:
-        await update.message.reply_text(f"⚠️ Принт `{article}` добавлен, но файл на Drive не найден. Загрузи `{article}.png` в папку Prints.", parse_mode="Markdown")
+    msg = f"✅ Принт `{article}` — {name}"
+    if width_cm:
+        msg += f" | {width_cm} см"
+    msg += "\n"
+    msg += "Файл найден на Drive ✅" if file_id else f"⚠️ Файл не найден. Загрузи `{article}.png` в папку Prints."
+    await update.message.reply_text(msg, parse_mode="Markdown")
 
 async def cmd_resetqueue(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != OWNER_CHAT_ID:
         return
     conn = await get_db()
     today = date.today()
-    # Удаляем очередь и открытый лист за сегодня
     sheet = await conn.fetchrow(
         "SELECT id FROM print_sheets WHERE sheet_date=$1 AND status='open' ORDER BY id DESC LIMIT 1", today
     )
@@ -425,19 +443,132 @@ async def cmd_resetqueue(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         )
         await conn.execute("DELETE FROM print_sheets WHERE id=$1", sheet["id"])
         await conn.close()
-        await update.message.reply_text(f"🗑 Очередь сброшена. Удалено записей: {deleted or 0}.\nТеперь /makesheet соберёт лист заново.")
+        await update.message.reply_text(
+            f"🗑 Очередь сброшена. Удалено: {deleted or 0}.\nТеперь /makesheet соберёт лист заново."
+        )
     else:
         await conn.close()
         await update.message.reply_text("Нет открытого листа для сброса.")
 
+# ── ИНТЕРАКТИВ: /addtosheet ───────────────────────────────────────────────────
+async def cmd_addtosheet(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Добавить принты в текущий открытый лист вручную."""
+    if update.effective_user.id != OWNER_CHAT_ID:
+        return
+    SESSION[OWNER_CHAT_ID] = {"mode": "addtosheet", "articles": [], "widths": {}}
+    await update.message.reply_text(
+        "📋 *Режим: добавить в текущий лист*\n\n"
+        "Пиши артикулы по одному.\n"
+        "Если нужна конкретная ширина: `a130 25` (артикул пробел ширина в см)\n"
+        "Когда закончишь — /done",
+        parse_mode="Markdown"
+    )
+
+# ── ИНТЕРАКТИВ: /addnewfile ───────────────────────────────────────────────────
+async def cmd_addnewfile(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Создать новый файл из произвольных принтов."""
+    if update.effective_user.id != OWNER_CHAT_ID:
+        return
+    SESSION[OWNER_CHAT_ID] = {"mode": "newfile", "articles": [], "widths": {}}
+    await update.message.reply_text(
+        "🆕 *Режим: новый файл*\n\n"
+        "Пиши артикулы по одному.\n"
+        "Если нужна конкретная ширина: `a130 25` (артикул пробел ширина в см)\n"
+        "Когда закончишь — /done",
+        parse_mode="Markdown"
+    )
+
+# ── /done — завершить сессию ──────────────────────────────────────────────────
+async def cmd_done(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != OWNER_CHAT_ID:
+        return
+    session = SESSION.get(OWNER_CHAT_ID)
+    if not session:
+        await update.message.reply_text("Нет активной сессии. Начни с /addtosheet или /addnewfile")
+        return
+
+    articles = session["articles"]
+    widths   = session["widths"]
+    mode     = session["mode"]
+    SESSION.pop(OWNER_CHAT_ID, None)
+
+    if not articles:
+        await update.message.reply_text("Ты не добавил ни одного артикула.")
+        return
+
+    await update.message.reply_text(f"⏳ Собираю файл из {len(articles)} принтов...")
+
+    if mode == "addtosheet":
+        # Добавляем в текущий открытый лист
+        conn = await get_db()
+        today = date.today()
+        sheet_row = await conn.fetchrow(
+            "SELECT id FROM print_sheets WHERE sheet_date=$1 AND status='open'", today
+        )
+        sheet_id = sheet_row["id"] if sheet_row else await conn.fetchval(
+            "INSERT INTO print_sheets (sheet_date) VALUES ($1) RETURNING id", today
+        )
+        # Записываем в очередь с fake order_id = "manual_АРТИКУЛ"
+        for art in articles:
+            await conn.execute(
+                "INSERT INTO print_queue (order_id, article, sheet_id, status) VALUES ($1,$2,$3,'added') ON CONFLICT DO NOTHING",
+                f"manual_{art}", art, sheet_id
+            )
+        await conn.close()
+        # Строим лист из всей очереди
+        await send_sheet_to_owner(ctx.bot)
+
+    elif mode == "newfile":
+        pdf_bytes, found = await build_sheet_from_articles(articles, widths)
+        if not pdf_bytes:
+            await update.message.reply_text("❌ Ни один файл не найден на Drive.")
+            return
+        not_found = [a for a in articles if a not in found]
+        caption = f"🖨 *Новый файл*\n\nПринтов: {len(found)}\n" + "\n".join(f"• {a}" for a in found)
+        if not_found:
+            caption += f"\n\n⚠️ Не найдено: {', '.join(not_found)}"
+        pdf_file = io.BytesIO(pdf_bytes)
+        pdf_file.name = f"custom_sheet_{date.today()}.pdf"
+        await ctx.bot.send_document(OWNER_CHAT_ID, document=pdf_file, caption=caption, parse_mode="Markdown")
+
+# ── ОБРАБОТЧИК ТЕКСТОВЫХ СООБЩЕНИЙ (сессия) ──────────────────────────────────
+async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != OWNER_CHAT_ID:
+        return
+    session = SESSION.get(OWNER_CHAT_ID)
+    if not session:
+        return  # не в сессии — игнорируем
+
+    text = update.message.text.strip()
+    if not text:
+        return
+
+    parts = text.split()
+    article = parts[0].lower()
+    width_cm = None
+    if len(parts) >= 2:
+        try:
+            width_cm = float(parts[1])
+        except ValueError:
+            pass
+
+    session["articles"].append(article)
+    if width_cm:
+        session["widths"][article] = width_cm
+
+    msg = f"➕ `{article}`"
+    if width_cm:
+        msg += f" — {width_cm} см"
+    msg += f"\nВсего: {len(session['articles'])}. Пиши ещё или /done"
+    await update.message.reply_text(msg, parse_mode="Markdown")
+
 # ── SEND SHEET TO OWNER ───────────────────────────────────────────────────────
 async def send_sheet_to_owner(bot):
-    """Собирает gang sheet и отправляет владельцу на одобрение."""
     try:
         pdf_bytes, articles, sheet_id = await build_print_sheet()
     except Exception as e:
         logger.error(f"Ошибка сборки листа: {e}")
-        await bot.send_message(OWNER_CHAT_ID, f"❌ Ошибка при сборке листа: {e}")
+        await bot.send_message(OWNER_CHAT_ID, f"❌ Ошибка: {e}")
         return
 
     if not pdf_bytes:
@@ -448,32 +579,23 @@ async def send_sheet_to_owner(bot):
     caption = (
         f"🖨 *Лист на печать* #{sheet_id}\n\n"
         f"Принтов: {len(articles)}\n{articles_text}\n\n"
-        f"Одобри командой /good\n"
-        f"Если лист не готов — /nostop (добавим ещё)"
+        f"/good — одобрить\n/nostop — лист не готов, накапливать дальше"
     )
-
     pdf_file = io.BytesIO(pdf_bytes)
     pdf_file.name = f"print_sheet_{date.today()}.pdf"
+    await bot.send_document(OWNER_CHAT_ID, document=pdf_file, caption=caption, parse_mode="Markdown")
 
-    await bot.send_document(
-        OWNER_CHAT_ID,
-        document=pdf_file,
-        caption=caption,
-        parse_mode="Markdown"
-    )
-
-# ── SCHEDULER: 12:00 МСК ─────────────────────────────────────────────────────
+# ── SCHEDULER ─────────────────────────────────────────────────────────────────
 async def daily_sheet_job(bot):
-    """Запускается каждый день в 12:00 МСК."""
     while True:
-        now = datetime.now(MSK)
-        # Следующий запуск в 12:00
+        now    = datetime.now(MSK)
         target = now.replace(hour=12, minute=0, second=0, microsecond=0)
         if now >= target:
-            target = target.replace(day=target.day + 1)
-        wait_seconds = (target - now).total_seconds()
-        logger.info(f"Следующий запуск листа через {wait_seconds/3600:.1f} ч")
-        await asyncio.sleep(wait_seconds)
+            from datetime import timedelta
+            target += timedelta(days=1)
+        wait = (target - now).total_seconds()
+        logger.info(f"Следующий запуск листа через {wait/3600:.1f} ч")
+        await asyncio.sleep(wait)
         logger.info("12:00 МСК — собираю print sheet")
         await send_sheet_to_owner(bot)
 
@@ -483,34 +605,37 @@ async def main():
 
     app = Application.builder().token(PRINT_BOT_TOKEN).build()
 
-    app.add_handler(CommandHandler("start",      cmd_start))
-    app.add_handler(CommandHandler("status",     cmd_status))
-    app.add_handler(CommandHandler("makesheet",  cmd_makesheet))
-    app.add_handler(CommandHandler("good",       cmd_good))
-    app.add_handler(CommandHandler("nostop",     cmd_nostop))
-    app.add_handler(CommandHandler("listprints", cmd_listprints))
+    app.add_handler(CommandHandler("start",       cmd_start))
+    app.add_handler(CommandHandler("status",      cmd_status))
+    app.add_handler(CommandHandler("makesheet",   cmd_makesheet))
+    app.add_handler(CommandHandler("good",        cmd_good))
+    app.add_handler(CommandHandler("nostop",      cmd_nostop))
+    app.add_handler(CommandHandler("listprints",  cmd_listprints))
     app.add_handler(CommandHandler("addprint",    cmd_addprint))
     app.add_handler(CommandHandler("resetqueue",  cmd_resetqueue))
+    app.add_handler(CommandHandler("addtosheet",  cmd_addtosheet))
+    app.add_handler(CommandHandler("addnewfile",  cmd_addnewfile))
+    app.add_handler(CommandHandler("done",        cmd_done))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-    # Запускаем планировщик параллельно
     async with app:
         await app.start()
         await app.updater.start_polling(drop_pending_updates=True)
 
-        # Выпадающее меню команд в Telegram
-        from telegram import BotCommand
         await app.bot.set_my_commands([
-            BotCommand("start",      "Запустить агента"),
-            BotCommand("makesheet",  "Собрать лист на печать сейчас"),
+            BotCommand("start",      "Справка по командам"),
+            BotCommand("makesheet",  "Собрать лист из подтверждённых заказов"),
+            BotCommand("addtosheet", "Добавить принты в текущий лист вручную"),
+            BotCommand("addnewfile", "Создать новый файл из любых принтов"),
             BotCommand("good",       "Одобрить лист — отправить в печать"),
             BotCommand("nostop",     "Лист не готов — продолжить накапливать"),
+            BotCommand("done",       "Завершить ввод артикулов"),
             BotCommand("status",     "Текущая очередь принтов"),
             BotCommand("listprints", "База всех принтов"),
-            BotCommand("addprint",    "Добавить принт: /addprint АРТИКУЛ НАЗВАНИЕ"),
-            BotCommand("resetqueue",  "Сбросить очередь и собрать лист заново"),
+            BotCommand("addprint",   "Добавить принт: АРТИКУЛ НАЗВАНИЕ ШИРИНА_СМ"),
+            BotCommand("resetqueue", "Сбросить очередь"),
         ])
 
-        # Стартовое сообщение
         await app.bot.send_message(
             OWNER_CHAT_ID,
             "🖨 *Print Agent запущен*\n\n"
@@ -519,9 +644,7 @@ async def main():
             parse_mode="Markdown"
         )
 
-        # Планировщик
         asyncio.create_task(daily_sheet_job(app.bot))
-
         await asyncio.Event().wait()
 
 if __name__ == "__main__":
