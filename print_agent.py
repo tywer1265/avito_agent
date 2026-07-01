@@ -271,54 +271,66 @@ async def build_print_sheet() -> tuple[bytes | None, list[str], int | None]:
         if not images_with_widths:
             return None, [], sheet_id
 
+        # Сериализуем PIL images в bytes перед передачей в thread
+        raw_for_render = []
+        for img, target_w in images_with_widths:
+            buf = io.BytesIO()
+            img.save(buf, "PNG")
+            raw_for_render.append((buf.getvalue(), target_w))
+
         def render():
-            sheet_img = pack_images(images_with_widths)
-            return sheet_to_png(sheet_img)
-        logger.info(f"Запускаю pack+pdf в to_thread для {len(images_with_widths)} принтов")
-        pdf_bytes = await asyncio.to_thread(render)
-        logger.info(f"PDF готов: {len(pdf_bytes)} байт")
-        return pdf_bytes, added_articles, sheet_id
+            imgs = [(Image.open(io.BytesIO(b)).convert("RGBA"), w) for b, w in raw_for_render]
+            return sheet_to_png(pack_images(imgs))
+
+        logger.info(f"Запускаю render в to_thread для {len(raw_for_render)} принтов")
+        png_bytes = await asyncio.to_thread(render)
+        logger.info(f"PNG готов: {len(png_bytes)//1024} KB")
+        return png_bytes, added_articles, sheet_id
     finally:
         await conn.close()
 
 # ── CORE: BUILD SHEET FROM ARTICLE LIST ───────────────────────────────────────
 async def build_sheet_from_articles(articles: list[str], custom_widths: dict[str, float]) -> tuple[bytes | None, list[str]]:
-    """Собирает PDF из произвольного списка артикулов."""
+    """Собирает PNG из произвольного списка артикулов.
+    IO (Drive + DB) — async. CPU (PIL + PNG) — в to_thread.
+    """
     conn = await get_db()
     drive, _ = get_google_services()
     try:
-        images_with_widths = []
+        # 1. Скачиваем все файлы асинхронно (в основном потоке)
+        raw_images = []  # [(bytes, target_w), ...]
         found = []
         for article in articles:
             file_id = find_drive_file(drive, article)
             if not file_id:
-                logger.warning(f"Файл не найден: {article}")
+                logger.warning(f"НЕ найден на Drive: {article}")
                 continue
             file_bytes = download_drive_file(drive, file_id)
-            try:
-                img = Image.open(io.BytesIO(file_bytes)).convert("RGBA")
-                if article in custom_widths:
-                    target_w = cm_to_px(custom_widths[article])
-                else:
-                    p = await conn.fetchrow("SELECT width_cm FROM prints WHERE article=$1", article)
-                    target_w = cm_to_px(p["width_cm"]) if p and p["width_cm"] else None
-                images_with_widths.append((img, target_w))
-                found.append(article)
-            except Exception as e:
-                logger.error(f"Ошибка {article}: {e}", exc_info=True)
+            logger.info(f"Скачан {article}: {len(file_bytes)//1024} KB")
+            if article in custom_widths:
+                target_w = cm_to_px(custom_widths[article])
+            else:
+                p = await conn.fetchrow("SELECT width_cm FROM prints WHERE article=$1", article)
+                target_w = cm_to_px(p["width_cm"]) if p and p["width_cm"] else None
+            raw_images.append((file_bytes, target_w))
+            found.append(article)
 
-        if not images_with_widths:
+        if not raw_images:
             return None, []
 
-        # CPU-тяжёлые операции выносим в отдельный поток
-        logger.info(f"Запускаю pack+pdf в to_thread для {len(images_with_widths)} принтов")
+        # 2. CPU: PIL открытие + компоновка + PNG — в отдельном потоке
         def render():
-            sheet_img = pack_images(images_with_widths)
-            return sheet_to_png(sheet_img)
+            images_with_widths = []
+            for file_bytes, target_w in raw_images:
+                img = Image.open(io.BytesIO(file_bytes)).convert("RGBA")
+                images_with_widths.append((img, target_w))
+            sheet = pack_images(images_with_widths)
+            return sheet_to_png(sheet)
 
-        pdf_bytes = await asyncio.to_thread(render)
-        logger.info(f"PDF готов: {len(pdf_bytes)} байт")
-        return pdf_bytes, found
+        logger.info(f"Запускаю render в to_thread для {len(raw_images)} принтов")
+        png_bytes = await asyncio.to_thread(render)
+        logger.info(f"PNG готов: {len(png_bytes)//1024} KB")
+        return png_bytes, found
     finally:
         await conn.close()
 
