@@ -216,7 +216,8 @@ def sheet_to_pdf(pil_image: Image.Image) -> bytes:
         # preserveAspectRatio=False, anchor не используем — просто растягиваем на лист
         pdf.drawImage(tmp_path, 0, 0,
                       width=SHEET_W_CM * cm_unit,
-                      height=SHEET_H_CM * cm_unit)
+                      height=SHEET_H_CM * cm_unit,
+                      mask="auto")
         pdf.save()
         result = pdf_buf.getvalue()
         logger.info(f"PDF: {len(result)//1024} KB")
