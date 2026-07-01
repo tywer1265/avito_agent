@@ -154,14 +154,24 @@ def get_confirmed_orders(sheets) -> list[dict]:
 def pack_images(images: list[Image.Image]) -> Image.Image:
     """
     Упаковывает изображения в лист 57x100 см максимально плотно.
-    Простой алгоритм: строки сверху вниз, изображения масштабируются пропорционально.
+    Прозрачный фон. Масштабирует принты до 1/3 ширины листа минимум.
     """
-    sheet = Image.new("RGBA", (SHEET_W_PX, SHEET_H_PX), (255, 255, 255, 255))
+    sheet = Image.new("RGBA", (SHEET_W_PX, SHEET_H_PX), (0, 0, 0, 0))  # прозрачный фон
     x, y = 0, 0
     row_h = 0
 
+    # Минимальный размер принта — треть ширины листа
+    MIN_PRINT_W = SHEET_W_PX // 3
+
     for img in images:
-        # Масштабируем если шире листа
+        img = img.convert("RGBA")
+
+        # Масштабируем вверх если принт слишком маленький
+        if img.width < MIN_PRINT_W:
+            ratio = MIN_PRINT_W / img.width
+            img = img.resize((MIN_PRINT_W, int(img.height * ratio)), Image.LANCZOS)
+
+        # Масштабируем вниз если шире листа
         if img.width > SHEET_W_PX:
             ratio = SHEET_W_PX / img.width
             img = img.resize((SHEET_W_PX, int(img.height * ratio)), Image.LANCZOS)
@@ -177,23 +187,24 @@ def pack_images(images: list[Image.Image]) -> Image.Image:
             logger.warning("Лист заполнен, остаток принтов не уместился")
             break
 
-        sheet.paste(img, (x, y), img if img.mode == "RGBA" else None)
+        sheet.paste(img, (x, y), img)
         x += img.width
         row_h = max(row_h, img.height)
 
     return sheet
 
 def sheet_to_pdf(pil_image: Image.Image) -> bytes:
-    """Конвертирует PIL Image в PDF байты нужного размера."""
+    """Конвертирует PIL Image в PDF байты нужного размера. Прозрачный фон."""
     buf = io.BytesIO()
     pdf = canvas.Canvas(buf, pagesize=(SHEET_W_CM * cm, SHEET_H_CM * cm))
 
-    # Сохраняем как PNG во временный файл
+    # Сохраняем как PNG с прозрачностью
     with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
-        pil_image.save(tmp.name, "PNG")
+        pil_image.save(tmp.name, "PNG")  # PNG сохраняет альфа-канал
         tmp_path = tmp.name
 
-    pdf.drawImage(tmp_path, 0, 0, width=SHEET_W_CM * cm, height=SHEET_H_CM * cm)
+    # mask="auto" — reportlab уважает прозрачность PNG
+    pdf.drawImage(tmp_path, 0, 0, width=SHEET_W_CM * cm, height=SHEET_H_CM * cm, mask="auto")
     pdf.save()
     os.unlink(tmp_path)
     return buf.getvalue()
